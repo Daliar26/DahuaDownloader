@@ -7,3 +7,4 @@ local.properties
 secrets.properties
 *.jks
 *.keystore
+*.log
