@@ -3,28 +3,38 @@ package ru.dahuatools.downloader
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import java.util.UUID
-
-data class DownloadJob(
-    val id: String = UUID.randomUUID().toString(),
-    val camera: Int,
-    val date: String,
-    val start: String,
-    val end: String,
-    val fileName: String,
-    val status: String = "В очереди"
-)
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -38,24 +48,36 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun DownloaderScreen() {
-    var serial by remember { mutableStateOf("") }
-    var camera by remember { mutableStateOf("1") }
-    var date by remember { mutableStateOf("") }
-    var start by remember { mutableStateOf("10:00:00") }
-    var end by remember { mutableStateOf("10:15:00") }
-    var fileName by remember { mutableStateOf("") }
-    var parallel by remember { mutableIntStateOf(1) }
-    var message by remember { mutableStateOf("Готов к работе") }
+private fun Field(
+    value: String,
+    onChange: (String) -> Unit,
+    label: String,
+    keyboard: KeyboardType = KeyboardType.Text,
+    password: Boolean = false,
+    enabled: Boolean = true
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onChange,
+        label = { Text(label) },
+        singleLine = true,
+        enabled = enabled,
+        visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,
+        keyboardOptions = KeyboardOptions(keyboardType = if (password) KeyboardType.Password else keyboard),
+        modifier = Modifier.fillMaxWidth()
+    )
+}
 
-    val jobs = remember { mutableStateListOf<DownloadJob>() }
-
+@Composable
+fun DownloaderScreen(vm: AppViewModel = viewModel()) {
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
     ) {
         LazyColumn(
-            modifier = Modifier.padding(18.dp),
+            modifier = Modifier
+                .safeDrawingPadding()
+                .padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
@@ -64,133 +86,108 @@ fun DownloaderScreen() {
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold
                 )
-                Text("Удалённый менеджер видеозаписей")
+                Text("Архив Dahua DHI-NVR2104-P-4KS2 · подключение по локальной сети")
             }
 
+            // ---------------- подключение
             item {
                 Card(shape = RoundedCornerShape(18.dp)) {
-                    Column(
-                        Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("Подключение P2P",
-                            style = MaterialTheme.typography.titleMedium)
-
-                        OutlinedTextField(
-                            value = serial,
-                            onValueChange = { serial = it },
-                            label = { Text("Серийный номер") },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        Text("Dahua DHI-NVR2104-P-4KS2")
-                        Text("Подключение SDK пока не настроено.")
-                    }
-                }
-            }
-
-            item {
-                Card {
-                    Column(
-                        Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("Новое задание",
-                            style = MaterialTheme.typography.titleMedium)
-
-                        OutlinedTextField(
-                            value = camera,
-                            onValueChange = { camera = it },
-                            label = { Text("Канал камеры (1–4)") },
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.Number
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        OutlinedTextField(
-                            value = date,
-                            onValueChange = { date = it },
-                            label = { Text("Дата ГГГГ-ММ-ДД") },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        OutlinedTextField(
-                            value = start,
-                            onValueChange = { start = it },
-                            label = { Text("Время начала") },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        OutlinedTextField(
-                            value = end,
-                            onValueChange = { end = it },
-                            label = { Text("Время окончания") },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        OutlinedTextField(
-                            value = fileName,
-                            onValueChange = { fileName = it },
-                            label = { Text("Имя файла") },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        Button(
-                            modifier = Modifier.fillMaxWidth(),
-                            onClick = {
-                                val ch = camera.toIntOrNull()
-                                val valid =
-                                    ch != null && ch in 1..4 &&
-                                    date.matches(Regex("\\d{4}-\\d{2}-\\d{2}")) &&
-                                    start.matches(Regex("\\d{2}:\\d{2}:\\d{2}")) &&
-                                    end.matches(Regex("\\d{2}:\\d{2}:\\d{2}")) &&
-                                    start < end &&
-                                    fileName.isNotBlank()
-
-                                if (valid) {
-                                    jobs.add(
-                                        DownloadJob(
-                                            camera = ch!!,
-                                            date = date,
-                                            start = start,
-                                            end = end,
-                                            fileName = fileName.trim()
-                                        )
-                                    )
-                                    fileName = ""
-                                    message = "Задание добавлено в очередь"
-                                } else {
-                                    message = "Проверь параметры задания"
-                                }
-                            }
-                        ) {
-                            Text("Добавить в очередь")
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Подключение (LAN)", style = MaterialTheme.typography.titleMedium)
+                        Field(vm.ip, { vm.ip = it }, "IP-адрес регистратора", enabled = !vm.connected)
+                        Field(vm.port, { vm.port = it }, "Порт (по умолчанию 37777)",
+                            keyboard = KeyboardType.Number, enabled = !vm.connected)
+                        Field(vm.user, { vm.user = it }, "Логин", enabled = !vm.connected)
+                        Field(vm.password, { vm.password = it }, "Пароль",
+                            password = true, enabled = !vm.connected)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { vm.connect() },
+                                enabled = !vm.connected && !vm.busy
+                            ) { Text("Подключиться") }
+                            OutlinedButton(
+                                onClick = { vm.disconnect() },
+                                enabled = vm.connected && !vm.busy
+                            ) { Text("Отключиться") }
+                        }
+                        Text(vm.status, fontWeight = FontWeight.Bold)
+                        if (vm.deviceInfo.isNotBlank()) {
+                            Text(vm.deviceInfo, style = MaterialTheme.typography.bodySmall)
                         }
                     }
                 }
             }
 
+            // ---------------- задание
+            item {
+                Card(shape = RoundedCornerShape(18.dp)) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Новое задание", style = MaterialTheme.typography.titleMedium)
+                        Field(vm.channel, { vm.channel = it }, "Канал камеры (1–4)",
+                            keyboard = KeyboardType.Number)
+                        Field(vm.date, { vm.date = it }, "Дата ГГГГ-ММ-ДД")
+                        Field(vm.start, { vm.start = it }, "Время начала (по часам регистратора)")
+                        Field(vm.end, { vm.end = it }, "Время окончания")
+                        Field(vm.fileName, { vm.fileName = it }, "Имя файла")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { vm.search() },
+                                enabled = vm.connected && !vm.busy
+                            ) { Text("Найти записи") }
+                            Button(onClick = { vm.enqueue() }) { Text("В очередь") }
+                        }
+                        Text(vm.message, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+
+            // ---------------- результаты поиска
+            if (vm.found.isNotEmpty()) {
+                item {
+                    Text(
+                        "Найдено файлов: ${vm.found.size}",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+                items(vm.found.take(30)) { r ->
+                    Card(shape = RoundedCornerShape(12.dp)) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("${r.start} – ${r.end}")
+                            Text(
+                                String.format("%.1f МБ · %s", r.sizeKb / 1024.0, r.name),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                }
+                if (vm.found.size > 30) {
+                    item { Text("…и ещё ${vm.found.size - 30}") }
+                }
+            }
+
+            // ---------------- управление очередью
             item {
                 Card {
-                    Column(
-                        Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("Количество потоков")
-
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Одновременных загрузок")
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             (1..3).forEach { n ->
                                 FilterChip(
-                                    selected = parallel == n,
-                                    onClick = { parallel = n },
+                                    selected = vm.parallel == n,
+                                    onClick = { vm.parallel = n },
                                     label = { Text("$n") }
                                 )
                             }
                         }
-
+                        Button(
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = { vm.startQueue() },
+                            enabled = vm.connected
+                        ) { Text("Начать загрузку") }
                         Text(
-                            "Реальная параллельная загрузка появится после интеграции Dahua SDK.",
+                            "Файлы сохраняются в формате .dav в папку приложения. " +
+                                "Лучше начинать с 1 потока: сколько параллельных загрузок " +
+                                "выдерживает регистратор, пока не проверено.",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -199,26 +196,52 @@ fun DownloaderScreen() {
 
             item {
                 Text(
-                    "Очередь загрузок: ${jobs.size}",
+                    "Очередь загрузок: ${vm.jobs.size}",
                     style = MaterialTheme.typography.titleLarge
                 )
             }
 
-            items(jobs, key = { it.id }) { job ->
+            items(vm.jobs, key = { it.id }) { job ->
                 Card(shape = RoundedCornerShape(14.dp)) {
-                    Column(Modifier.padding(14.dp)) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(job.fileName, fontWeight = FontWeight.Bold)
-                        Text("Камера ${job.camera}")
-                        Text("${job.date} ${job.start} – ${job.end}")
-                        Text(job.status)
+                        Text("Камера ${job.camera} · ${job.date} ${job.start} – ${job.end}")
+                        Text(job.status.label)
+                        if (job.status == JobStatus.RUNNING || job.status == JobStatus.DONE) {
+                            LinearProgressIndicator(
+                                progress = { job.progress / 100f },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        if (job.message.isNotBlank()) {
+                            Text(job.message, style = MaterialTheme.typography.bodySmall)
+                        }
+                        if (job.status == JobStatus.QUEUED || job.status == JobStatus.RUNNING) {
+                            TextButton(onClick = { vm.cancelJob(job.id) }) { Text("Отменить") }
+                        }
+                    }
+                }
+            }
+
+            // ---------------- журнал
+            item {
+                Card {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Журнал (можно выделить и скопировать)", style = MaterialTheme.typography.titleMedium)
+                        SelectionContainer {
+                            Text(
+                                if (vm.log.isEmpty()) "Пока пусто" else vm.log.take(40).joinToString("\n"),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp
+                            )
+                        }
                     }
                 }
             }
 
             item {
-                Text(message)
                 Text(
-                    "Версия 0.1.0 · Прототип",
+                    "Версия 0.2.0 · LAN, тестовая",
                     style = MaterialTheme.typography.labelSmall
                 )
             }

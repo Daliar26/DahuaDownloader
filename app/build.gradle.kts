@@ -12,8 +12,32 @@ android {
         applicationId = "ru.dahuatools.downloader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
+
+        // Библиотеки Dahua SDK собраны только под arm64-v8a.
+        // На 32-битных устройствах и x86-эмуляторах SDK не заработает.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    // Нативные библиотеки SDK извлекаются при установке: libssl/libnetsdk
+    // подгружают друг друга по имени (dlopen), и так это работает надёжнее.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
     }
 
     buildFeatures {
@@ -38,5 +62,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
