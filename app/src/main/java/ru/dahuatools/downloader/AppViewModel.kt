@@ -100,7 +100,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun setParallel(n: Int) {
+    fun updateParallel(n: Int) {
         parallel = n.coerceIn(1, 3)
         semaphore = Semaphore(parallel)
         prefs.edit().putInt("parallel", parallel).apply()

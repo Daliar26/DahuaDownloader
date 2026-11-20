@@ -533,7 +533,7 @@ private fun SettingsDialog(vm: AppViewModel) {
                         (1..3).forEach { n ->
                             FilterChip(
                                 selected = vm.parallel == n,
-                                onClick = { vm.setParallel(n) },
+                                onClick = { vm.updateParallel(n) },
                                 label = { Text("$n") }
                             )
                         }
