@@ -12,8 +12,8 @@ android {
         applicationId = "ru.dahuatools.downloader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
 
         // Библиотеки Dahua SDK собраны только под arm64-v8a.
         // На 32-битных устройствах и x86-эмуляторах SDK не заработает.
@@ -64,5 +64,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // Перепаковка DAV -> MP4 (FFmpeg). Подключена через рефлексию: если Gradle не сможет
+    // скачать эту библиотеку, удалите ОДНУ строку ниже. Приложение продолжит работать,
+    // но будет сохранять исходный DAV вместо MP4.
+    implementation("com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.1.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

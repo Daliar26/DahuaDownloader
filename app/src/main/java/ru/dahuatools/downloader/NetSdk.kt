@@ -2,6 +2,7 @@ package ru.dahuatools.downloader
 
 import com.company.NetSDK.CB_fDisConnect
 import com.company.NetSDK.CB_fHaveReConnect
+import com.company.NetSDK.CB_fSearchDevicesCB
 import com.company.NetSDK.CB_fTimeDownLoadPosCallBack
 import com.company.NetSDK.EM_LOGIN_SPAC_CAP_TYPE
 import com.company.NetSDK.EM_QUERY_RECORD_TYPE
@@ -16,8 +17,8 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
-import java.time.LocalDate
-import java.time.LocalTime
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 class SdkException(message: String) : Exception(message)
 
@@ -163,10 +164,11 @@ object NetSdk {
                 if (r == 1) {
                     items.add(
                         RecordItem(
-                            name = String(info.filename).substringBefore('\u0000'),
+                            camera = channel0 + 1,
                             start = fmt(info.starttime),
                             end = fmt(info.endtime),
-                            sizeKb = info.size.toLong() and 0xFFFFFFFFL
+                            sizeKb = info.size.toLong() and 0xFFFFFFFFL,
+                            name = String(info.filename).substringBefore('\u0000')
                         )
                     )
                 } else if (r == 0) {
@@ -240,16 +242,53 @@ object NetSdk {
         }
     }
 
-    fun netTime(d: LocalDate, t: LocalTime): NET_TIME {
+    private val timeFmt: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+
+    fun parseDateTime(text: String): LocalDateTime = LocalDateTime.parse(text.trim(), timeFmt)
+
+    fun netTime(dt: LocalDateTime): NET_TIME {
         val r = NET_TIME()
-        r.dwYear = d.year.toLong()
-        r.dwMonth = d.monthValue.toLong()
-        r.dwDay = d.dayOfMonth.toLong()
-        r.dwHour = t.hour.toLong()
-        r.dwMinute = t.minute.toLong()
-        r.dwSecond = t.second.toLong()
+        r.dwYear = dt.year.toLong()
+        r.dwMonth = dt.monthValue.toLong()
+        r.dwDay = dt.dayOfMonth.toLong()
+        r.dwHour = dt.hour.toLong()
+        r.dwMinute = dt.minute.toLong()
+        r.dwSecond = dt.second.toLong()
         return r
     }
+
+    /**
+     * Поиск регистраторов в локальной сети средствами SDK (широковещательный запрос Dahua).
+     * Вызывать после ensureInit и с включённым MulticastLock Wi-Fi.
+     */
+    fun discover(waitMs: Long): List<DiscoveredDevice> {
+        val found = java.util.concurrent.CopyOnWriteArrayList<DiscoveredDevice>()
+        val cb = CB_fSearchDevicesCB { d ->
+            if (d != null) {
+                found.add(
+                    DiscoveredDevice(
+                        ip = cstr(d.szIP),
+                        port = d.nPort,
+                        serial = cstr(d.szSerialNo),
+                        type = cstr(d.szDeviceType),
+                        name = cstr(d.szDevName)
+                    )
+                )
+            }
+        }
+        val h = INetSDK.StartSearchDevices(cb)
+        if (h == 0L) throw SdkException("StartSearchDevices: ошибка SDK ${lastError()}")
+        try {
+            Thread.sleep(waitMs)
+        } finally {
+            INetSDK.StopSearchDevices(h)
+            cb.hashCode()
+        }
+        return found.filter { it.ip.isNotEmpty() }.distinctBy { it.ip }
+    }
+
+    private fun cstr(b: ByteArray?): String =
+        if (b == null) "" else String(b, Charsets.UTF_8).substringBefore('\u0000').trim()
 
     private fun fmt(t: NET_TIME?): String {
         if (t == null) return "?"

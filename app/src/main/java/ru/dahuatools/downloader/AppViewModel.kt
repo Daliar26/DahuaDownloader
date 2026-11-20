@@ -2,6 +2,7 @@ package ru.dahuatools.downloader
 
 import android.app.Application
 import android.content.Context
+import android.net.wifi.WifiManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -9,7 +10,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.company.NetSDK.NET_TIME
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +21,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
@@ -29,6 +30,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences("connection", Context.MODE_PRIVATE)
     private val logTime = DateTimeFormatter.ofPattern("HH:mm:ss")
+    private val dateTimeFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+
+    // --- навигация и настройки ---
+    var tab by mutableIntStateOf(0)
+    var showSettings by mutableStateOf(false)
+    var showLog by mutableStateOf(false)
+    var parallel by mutableIntStateOf(prefs.getInt("parallel", 1).coerceIn(1, 3))
+        private set
+    var convertMp4 by mutableStateOf(prefs.getBoolean("mp4", true))
+        private set
+    val mp4Available: Boolean = Mp4Converter.available()
 
     // --- подключение (пароль в память только на время ввода, на диск не пишется) ---
     var ip by mutableStateOf(prefs.getString("ip", "") ?: "")
@@ -44,22 +56,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var deviceInfo by mutableStateOf("")
         private set
 
-    // --- форма задания ---
+    // --- поиск устройств в сети ---
+    val devices = mutableStateListOf<DiscoveredDevice>()
+    var scanning by mutableStateOf(false)
+        private set
+    var scanNote by mutableStateOf("")
+        private set
+
+    // --- архив ---
     var channel by mutableStateOf("1")
     var date by mutableStateOf(LocalDate.now().toString())
     var start by mutableStateOf("10:00:00")
     var end by mutableStateOf("10:15:00")
-    var fileName by mutableStateOf("")
-    var parallel by mutableIntStateOf(1)
     var message by mutableStateOf("Готов к работе")
         private set
-
     val found = mutableStateListOf<RecordItem>()
+    var resultsExpanded by mutableStateOf(true)
+    var shownCount by mutableIntStateOf(20)
+
+    // --- загрузки ---
     val jobs = mutableStateListOf<DownloadJob>()
     val log = mutableStateListOf<String>()
 
     private var loginHandle = 0L
     private val running = HashMap<String, Job>()
+    private var semaphore = Semaphore(parallel)
+
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                Storage.cleanTemp(app)
+            } catch (e: Exception) {
+                // не критично
+            }
+        }
+    }
 
     fun addLog(msg: String) {
         val line = "${LocalTime.now().format(logTime)} $msg"
@@ -69,13 +100,79 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setParallel(n: Int) {
+        parallel = n.coerceIn(1, 3)
+        semaphore = Semaphore(parallel)
+        prefs.edit().putInt("parallel", parallel).apply()
+    }
+
+    fun setConvert(on: Boolean) {
+        convertMp4 = on
+        prefs.edit().putBoolean("mp4", on).apply()
+    }
+
     // ------------------------------------------------------------------ подключение
+
+    fun useDevice(d: DiscoveredDevice) {
+        ip = d.ip
+        port = if (d.port > 0) d.port.toString() else "37777"
+        status = "Выбран ${d.ip}. Введите логин и пароль."
+    }
+
+    fun scan() {
+        if (scanning || busy) return
+        scanning = true
+        scanNote = "Поиск в локальной сети…"
+        devices.clear()
+        viewModelScope.launch {
+            try {
+                val list = withContext(Dispatchers.IO) {
+                    val wifi = getApplication<Application>().applicationContext
+                        .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                    // Без MulticastLock Android отбрасывает широковещательные ответы.
+                    val lock = try {
+                        wifi?.createMulticastLock("dahua-discovery")?.also {
+                            it.setReferenceCounted(false)
+                            it.acquire()
+                        }
+                    } catch (e: SecurityException) {
+                        null
+                    }
+                    try {
+                        NetSdk.onEvent = { addLog(it) }
+                        NetSdk.ensureInit { addLog(it) }
+                        NetSdk.discover(4000)
+                    } finally {
+                        lock?.release()
+                    }
+                }
+                devices.addAll(list)
+                scanNote = if (list.isEmpty()) {
+                    "Ничего не найдено. Телефон должен быть в той же Wi-Fi сети; " +
+                        "на некоторых роутерах поиск заблокирован — введите IP вручную."
+                } else {
+                    "Найдено устройств: ${list.size}"
+                }
+                addLog(scanNote)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: SdkException) {
+                scanNote = e.message ?: "Ошибка поиска"
+                addLog("Поиск: ${e.message}")
+            } catch (e: Throwable) {
+                scanNote = "Сбой поиска: ${e.javaClass.simpleName}: ${e.message}"
+                addLog(scanNote)
+            } finally {
+                scanning = false
+            }
+        }
+    }
 
     fun connect() {
         if (busy || connected) return
         val p = port.trim().toIntOrNull()
         if (ip.isBlank() || p == null || p !in 1..65535 || user.isBlank() || password.isEmpty()) {
-            status = "Заполните IP, порт, логин и пароль"
+            status = "Заполните адрес, порт, логин и пароль"
             return
         }
         val host = ip.trim()
@@ -99,6 +196,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 prefs.edit().putString("ip", host).putString("port", p.toString())
                     .putString("user", login).apply()
                 addLog("Вход выполнен. $deviceInfo")
+                tab = 1
             } catch (e: CancellationException) {
                 throw e
             } catch (e: SdkException) {
@@ -156,9 +254,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val res = withContext(Dispatchers.IO) {
-                    NetSdk.findRecordings(loginHandle, q.channel0, q.from, q.to, 500)
+                    NetSdk.findRecordings(
+                        loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
+                    )
                 }
                 found.addAll(res.items)
+                shownCount = 20
+                resultsExpanded = true
                 message = when {
                     res.items.isEmpty() -> "За этот период записей нет"
                     res.truncated -> "Найдено файлов: ${res.items.size} (показаны первые 500)"
@@ -179,41 +281,40 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ------------------------------------------------------------------ очередь
+    // ------------------------------------------------------------------ загрузки
 
-    fun enqueue() {
-        val q = buildQuery() ?: return
-        val name = fileName.trim()
-        if (name.isEmpty()) {
-            message = "Укажите имя файла"
-            return
-        }
-        jobs.add(
-            DownloadJob(
-                camera = q.channel0 + 1,
-                date = date.trim(),
-                start = start.trim(),
-                end = end.trim(),
-                fileName = name
-            )
-        )
-        fileName = ""
-        message = "Задание добавлено в очередь"
-    }
-
-    fun startQueue() {
+    /** Скачать один найденный файл: сразу встаёт в очередь и стартует. */
+    fun downloadFile(r: RecordItem) {
         if (!connected) {
             message = "Сначала подключитесь к регистратору"
             return
         }
-        val sem = Semaphore(parallel.coerceIn(1, 3))
-        val ids = jobs.filter { it.status == JobStatus.QUEUED && !running.containsKey(it.id) }
-            .map { it.id }
-        if (ids.isEmpty()) {
-            message = "В очереди нет заданий"
+        addJob(r.camera, r.start, r.end)
+    }
+
+    /** Скачать период из формы. */
+    fun downloadPeriod() {
+        if (!connected) {
+            message = "Сначала подключитесь к регистратору"
             return
         }
-        ids.forEach { launchJob(it, sem) }
+        val q = buildQuery() ?: return
+        addJob(q.channel0 + 1, q.from.format(dateTimeFmt), q.to.format(dateTimeFmt))
+    }
+
+    private fun addJob(camera: Int, from: String, to: String) {
+        val dup = jobs.any {
+            it.camera == camera && it.from == from && it.to == to &&
+                it.status != JobStatus.ERROR && it.status != JobStatus.CANCELED
+        }
+        if (dup) {
+            message = "Эта запись уже в загрузках"
+            return
+        }
+        val job = DownloadJob(camera = camera, from = from, to = to)
+        jobs.add(0, job)
+        message = "Добавлено в загрузки"
+        launchJob(job.id)
     }
 
     fun cancelJob(id: String) {
@@ -227,52 +328,110 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun launchJob(id: String, sem: Semaphore) {
+    fun retryJob(id: String) {
+        if (!connected) {
+            message = "Сначала подключитесь к регистратору"
+            return
+        }
+        update(id) {
+            if (it.status == JobStatus.ERROR || it.status == JobStatus.CANCELED) {
+                it.copy(status = JobStatus.QUEUED, progress = 0, message = "")
+            } else it
+        }
+        launchJob(id)
+    }
+
+    fun removeJob(id: String) {
+        if (running.containsKey(id)) return
+        jobs.removeAll { it.id == id }
+    }
+
+    fun clearFinished() {
+        jobs.removeAll { !it.active }
+    }
+
+    private fun launchJob(id: String) {
+        if (running.containsKey(id)) return
+        val sem = semaphore
         val c = viewModelScope.launch(start = CoroutineStart.LAZY) {
-            var file: File? = null
+            val ctx = getApplication<Application>()
+            var dav: File? = null
+            var mp4: File? = null
             try {
                 sem.withPermit {
                     val job = jobs.firstOrNull { it.id == id } ?: return@withPermit
                     if (job.status != JobStatus.QUEUED) return@withPermit
-                    val (from, to) = parseRange(job.date, job.start, job.end)
-                    val f = targetFile(job.fileName)
-                    file = f
+                    val from = NetSdk.parseDateTime(job.from)
+                    val to = NetSdk.parseDateTime(job.to)
+                    val tmpDir = Storage.tempDir(ctx)
+                    val tmpDav = File(tmpDir, "$id.dav")
+                    dav = tmpDav
+
                     update(id) {
-                        it.copy(status = JobStatus.RUNNING, progress = 0, message = "Загрузка…", path = f.absolutePath)
+                        it.copy(status = JobStatus.RUNNING, progress = 0, message = "Скачивание с регистратора…")
                     }
-                    addLog("Старт: ${job.fileName} (канал ${job.camera}, ${job.date} ${job.start}–${job.end})")
+                    addLog("Старт: ${job.title}")
                     withContext(Dispatchers.IO) {
-                        NetSdk.downloadByTime(loginHandle, job.camera - 1, from, to, f) { pct ->
+                        NetSdk.downloadByTime(
+                            loginHandle, job.camera - 1,
+                            NetSdk.netTime(from), NetSdk.netTime(to), tmpDav
+                        ) { pct ->
                             viewModelScope.launch(Dispatchers.Main.immediate) {
                                 update(id) { it.copy(progress = pct) }
                             }
                         }
                     }
-                    val mb = f.length() / 1024.0 / 1024.0
+
+                    var exportFile = tmpDav
+                    var ext = "dav"
+                    var mime = "application/octet-stream"
+                    var note = ""
+                    if (convertMp4 && Mp4Converter.available()) {
+                        update(id) {
+                            it.copy(status = JobStatus.CONVERTING, progress = 100, message = "Конвертация в MP4…")
+                        }
+                        val out = File(tmpDir, "$id.mp4")
+                        mp4 = out
+                        val err = withContext(Dispatchers.IO) { Mp4Converter.convert(tmpDav, out) }
+                        if (err == null) {
+                            exportFile = out
+                            ext = "mp4"
+                            mime = "video/mp4"
+                        } else {
+                            note = "\nMP4 не получился, сохранён исходный DAV"
+                            addLog("Конвертация: $err")
+                        }
+                    } else if (convertMp4) {
+                        note = "\nFFmpeg нет в этой сборке, сохранён исходный DAV"
+                    }
+
+                    val shown = withContext(Dispatchers.IO) {
+                        Storage.exportToDownloads(ctx, exportFile, "${job.baseName}.$ext", mime)
+                    }
+                    val mb = exportFile.length() / 1024.0 / 1024.0
                     update(id) {
                         it.copy(
                             status = JobStatus.DONE,
                             progress = 100,
-                            message = String.format("Готово: %.1f МБ\n%s", mb, f.absolutePath)
+                            message = String.format("Сохранено: %s (%.1f МБ)%s", shown, mb, note)
                         )
                     }
-                    addLog("Готово: ${f.name}")
+                    addLog("Готово: $shown")
                 }
             } catch (e: CancellationException) {
-                file?.delete()
                 update(id) { it.copy(status = JobStatus.CANCELED, message = "Отменено") }
                 throw e
             } catch (e: SdkException) {
-                file?.delete()
                 update(id) { it.copy(status = JobStatus.ERROR, message = e.message ?: "Ошибка") }
                 addLog("Ошибка задания: ${e.message}")
             } catch (e: Throwable) {
-                file?.delete()
                 update(id) {
                     it.copy(status = JobStatus.ERROR, message = "Сбой: ${e.javaClass.simpleName}: ${e.message}")
                 }
                 addLog("Сбой задания: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
+                dav?.delete()
+                mp4?.delete()
                 running.remove(id)
             }
         }
@@ -287,7 +446,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (i >= 0) jobs[i] = f(jobs[i])
     }
 
-    private class Query(val channel0: Int, val from: NET_TIME, val to: NET_TIME)
+    private class Query(val channel0: Int, val from: LocalDateTime, val to: LocalDateTime)
 
     private fun buildQuery(): Query? {
         val c = channel.trim().toIntOrNull()
@@ -295,50 +454,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             message = "Канал должен быть от 1 до 4"
             return null
         }
-        return try {
-            val (from, to) = parseRange(date, start, end)
-            Query(c - 1, from, to)   // в SDK каналы нумеруются с 0
-        } catch (e: SdkException) {
-            message = e.message ?: "Проверьте параметры"
-            null
-        }
-    }
-
-    private fun parseRange(d: String, s: String, e: String): Pair<NET_TIME, NET_TIME> {
         val day = try {
-            LocalDate.parse(d.trim())
+            LocalDate.parse(date.trim())
         } catch (ex: DateTimeParseException) {
-            throw SdkException("Дата: формат ГГГГ-ММ-ДД")
+            message = "Дата: формат ГГГГ-ММ-ДД"
+            return null
         }
         val t1 = try {
-            LocalTime.parse(s.trim())
+            LocalTime.parse(start.trim())
         } catch (ex: DateTimeParseException) {
-            throw SdkException("Начало: формат ЧЧ:ММ:СС")
+            message = "Начало: формат ЧЧ:ММ:СС"
+            return null
         }
         val t2 = try {
-            LocalTime.parse(e.trim())
+            LocalTime.parse(end.trim())
         } catch (ex: DateTimeParseException) {
-            throw SdkException("Окончание: формат ЧЧ:ММ:СС")
+            message = "Окончание: формат ЧЧ:ММ:СС"
+            return null
         }
-        if (!t1.isBefore(t2)) throw SdkException("Начало должно быть раньше окончания")
-        return NetSdk.netTime(day, t1) to NetSdk.netTime(day, t2)
-    }
-
-    private fun targetFile(name: String): File {
-        val ctx = getApplication<Application>()
-        val dir = ctx.getExternalFilesDir("recordings") ?: File(ctx.filesDir, "recordings")
-        dir.mkdirs()
-        var base = name.replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_").trim().trim('.')
-        if (base.lowercase().endsWith(".dav")) base = base.dropLast(4)
-        base = base.take(100)
-        if (base.isEmpty()) base = "record"
-        var f = File(dir, "$base.dav")
-        var n = 1
-        while (f.exists()) {
-            f = File(dir, "${base}_$n.dav")
-            n++
+        if (!t1.isBefore(t2)) {
+            message = "Начало должно быть раньше окончания"
+            return null
         }
-        return f
+        return Query(c - 1, LocalDateTime.of(day, t1), LocalDateTime.of(day, t2))
     }
 
     override fun onCleared() {
