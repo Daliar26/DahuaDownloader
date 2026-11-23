@@ -16,9 +16,11 @@ data class DownloadJob(
     val camera: Int,          // номер канала как в интерфейсе: 1..4
     val from: String,         // ГГГГ-ММ-ДД ЧЧ:ММ:СС (время регистратора)
     val to: String,
+    val deviceFile: String,   // имя файла на регистраторе (нужно для докачки по смещению)
     val status: JobStatus = JobStatus.QUEUED,
     val progress: Int = 0,
-    val message: String = ""
+    val message: String = "",
+    val retryCount: Int = 0   // счётчик автоматических повторов после обрыва связи
 ) {
     val active: Boolean
         get() = status == JobStatus.QUEUED || status == JobStatus.RUNNING || status == JobStatus.CONVERTING

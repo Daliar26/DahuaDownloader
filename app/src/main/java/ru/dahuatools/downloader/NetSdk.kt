@@ -3,20 +3,20 @@ package ru.dahuatools.downloader
 import com.company.NetSDK.CB_fDisConnect
 import com.company.NetSDK.CB_fHaveReConnect
 import com.company.NetSDK.CB_fSearchDevicesCB
-import com.company.NetSDK.CB_fTimeDownLoadPosCallBack
 import com.company.NetSDK.EM_LOGIN_SPAC_CAP_TYPE
 import com.company.NetSDK.EM_QUERY_RECORD_TYPE
 import com.company.NetSDK.INetSDK
+import com.company.NetSDK.NET_IN_DOWNLOAD_PIECE_FILE
 import com.company.NetSDK.NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY
+import com.company.NetSDK.NET_OUT_DOWNLOAD_PIECE_FILE
 import com.company.NetSDK.NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY
 import com.company.NetSDK.NET_PARAM
 import com.company.NetSDK.NET_RECORDFILE_INFO
 import com.company.NetSDK.NET_TIME
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import java.io.File
+import java.io.RandomAccessFile
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
@@ -39,6 +39,9 @@ class SearchResult(val items: List<RecordItem>, val truncated: Boolean)
  */
 object NetSdk {
 
+    /** Размер одного запроса докачки. 512 КБ — компромисс между числом обращений и памятью. */
+    const val PIECE_CHUNK_BYTES = 512 * 1024
+
     @Volatile
     private var initialized = false
 
@@ -48,6 +51,10 @@ object NetSdk {
 
     @Volatile
     var onEvent: ((String) -> Unit)? = null
+
+    /** Вызывается, когда SDK сообщает о восстановлении связи после обрыва. */
+    @Volatile
+    var onReconnect: (() -> Unit)? = null
 
     fun lastError(): String = String.format("0x%08X", INetSDK.GetLastError())
 
@@ -79,6 +86,7 @@ object NetSdk {
         }
         val rc = CB_fHaveReConnect { _, ip, port ->
             onEvent?.invoke("Связь с $ip:$port восстановлена")
+            onReconnect?.invoke()
         }
         disconnectCb = dc
         reconnectCb = rc
@@ -184,67 +192,70 @@ object NetSdk {
     }
 
     /**
-     * Скачивание записи за период в один файл (формат DAV).
-     * Прогресс в процентах отдаётся в onProgress только при изменении.
-     * Отмена корутины останавливает загрузку в SDK.
+     * Докачка записи по имени файла на регистраторе, с продолжением с байта,
+     * на котором остановились (DownloadPieceFile — обычный синхронный запрос
+     * "дай кусок файла со смещения X", без отдельного потокового соединения).
+     *
+     * Если target уже существует и частично заполнен (от прошлой попытки),
+     * скачивание продолжается с его текущего размера — именно это даёт
+     * настоящую докачку после обрыва связи, а не повтор с начала.
+     *
+     * total в onProgress равен -1, пока размер файла ещё не известен
+     * (станет известен после первого успешного запроса).
      */
-    suspend fun downloadByTime(
+    suspend fun downloadFilePiece(
         login: Long,
-        channel0: Int,
-        from: NET_TIME,
-        to: NET_TIME,
+        deviceFileName: String,
         target: File,
-        onProgress: (Int) -> Unit
+        onProgress: (done: Long, total: Long) -> Unit
     ) {
-        val events = Channel<Pair<Int, Int>>(Channel.UNLIMITED)
-        val cb = CB_fTimeDownLoadPosCallBack { _, total, done, _, _ ->
-            events.trySend(total to done)
-        }
-        val handle = INetSDK.DownloadByTimeEx(
-            login, channel0, EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL,
-            from, to, target.absolutePath, cb, null, null
-        )
-        if (handle == 0L) throw SdkException("DownloadByTimeEx: ошибка SDK ${lastError()}")
+        var offset = if (target.exists()) target.length() else 0L
+        var total = -1L
 
-        try {
-            var reached = false
-            var lastPct = -1
+        RandomAccessFile(target, "rw").use { raf ->
+            raf.seek(offset)
             while (true) {
-                val timeout = if (reached) 15_000L else 120_000L
-                val ev = withTimeoutOrNull(timeout) { events.receive() }
-                if (ev == null) {
-                    if (reached) break
-                    throw SdkException("Регистратор не присылает данные больше 2 минут")
+                currentCoroutineContext().ensureActive()
+
+                if (offset + PIECE_CHUNK_BYTES > Int.MAX_VALUE.toLong()) {
+                    throw SdkException(
+                        "Файл больше 2 ГБ — докачка по частям для таких файлов пока не поддержана " +
+                            "(скачано ${offset / 1024 / 1024} МБ)"
+                    )
                 }
-                val (total, done) = ev
-                when {
-                    done == -1 -> break                                   // конец загрузки
-                    done == -2 -> throw SdkException("Не удалось записать файл на телефон")
-                    total > 0 -> {
-                        val pct = ((done.toLong() * 100) / total).toInt().coerceIn(0, 100)
-                        if (pct != lastPct) {
-                            lastPct = pct
-                            onProgress(pct)
-                        }
-                        if (done >= total) reached = true
-                    }
+
+                val inp = NET_IN_DOWNLOAD_PIECE_FILE()
+                putZ(deviceFileName, inp.szFileName, "Имя файла")
+                inp.nOffSet = offset.toInt()
+                inp.nNeedLength = PIECE_CHUNK_BYTES
+
+                val out = NET_OUT_DOWNLOAD_PIECE_FILE(PIECE_CHUNK_BYTES)
+                val ok = INetSDK.DownloadPieceFile(login, inp, out, 15000)
+                if (!ok) {
+                    throw SdkException(
+                        "Обрыв при скачивании на ${offset / 1024 / 1024} МБ " +
+                            "(SDK ${lastError()}). Можно продолжить позже с этого места."
+                    )
                 }
+
+                if (total < 0) {
+                    total = out.nFileLength.toLong() and 0xFFFFFFFFL
+                }
+
+                val got = out.nBufferLen
+                if (got <= 0) break
+                raf.write(out.szBuffer, 0, got)
+                offset += got
+                onProgress(offset, total)
+
+                if (total in 1..offset) break
             }
-        } finally {
-            withContext(NonCancellable) { INetSDK.StopDownload(handle) }
-            events.close()
-            // cb остаётся достижимым до этой точки
-            cb.hashCode()
         }
 
         if (!target.exists() || target.length() == 0L) {
             throw SdkException("Файл не создан или пустой (в этом периоде может не быть записи)")
         }
     }
-
-    private val timeFmt: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
-
-    fun parseDateTime(text: String): LocalDateTime = LocalDateTime.parse(text.trim(), timeFmt)
 
     fun netTime(dt: LocalDateTime): NET_TIME {
         val r = NET_TIME()
@@ -256,6 +267,10 @@ object NetSdk {
         r.dwSecond = dt.second.toLong()
         return r
     }
+
+    private val timeFmt: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+
+    fun parseDateTime(text: String): LocalDateTime = LocalDateTime.parse(text.trim(), timeFmt)
 
     /**
      * Поиск регистраторов в локальной сети средствами SDK (широковещательный запрос Dahua).

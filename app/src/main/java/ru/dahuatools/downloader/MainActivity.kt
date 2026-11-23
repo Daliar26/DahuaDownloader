@@ -354,12 +354,11 @@ private fun ArchiveTab(vm: AppViewModel) {
                     Box(Modifier.weight(1f)) { Field(vm.end, { vm.end = it }, "По (ЧЧ:ММ:СС)") }
                 }
                 Hint("Время указывайте по часам регистратора.")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { vm.search() }, enabled = vm.connected && !vm.busy) { Text("Найти") }
-                    OutlinedButton(onClick = { vm.downloadPeriod() }, enabled = vm.connected) {
-                        Text("Скачать период")
-                    }
-                }
+                Button(
+                    onClick = { vm.search() },
+                    enabled = vm.connected && !vm.busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Найти") }
                 Hint(vm.message)
             }
         }
@@ -380,10 +379,7 @@ private fun ArchiveTab(vm: AppViewModel) {
             }
             if (vm.resultsExpanded) {
                 items(vm.found.take(vm.shownCount)) { r ->
-                    val queued = vm.jobs.any {
-                        it.camera == r.camera && it.from == r.start && it.to == r.end &&
-                            it.status != JobStatus.ERROR && it.status != JobStatus.CANCELED
-                    }
+                    val queued = vm.jobs.any { it.deviceFile == r.name && it.active }
                     AppCard {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {

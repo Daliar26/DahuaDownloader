@@ -26,11 +26,13 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
 
+/** Сколько раз пробовать докачать файл автоматически после восстановления связи. */
+private const val MAX_AUTO_RETRIES = 3
+
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences("connection", Context.MODE_PRIVATE)
     private val logTime = DateTimeFormatter.ofPattern("HH:mm:ss")
-    private val dateTimeFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
 
     // --- навигация и настройки ---
     var tab by mutableIntStateOf(0)
@@ -184,6 +186,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val info = withContext(Dispatchers.IO) {
                     NetSdk.onEvent = { addLog(it) }
+                    NetSdk.onReconnect = { onConnectionRestored() }
                     NetSdk.ensureInit { addLog(it) }
                     NetSdk.login(host, p, login, pass)
                 }
@@ -239,6 +242,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Срабатывает, когда SDK сообщает, что связь с регистратором восстановлена. */
+    private fun onConnectionRestored() {
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            val candidates = jobs.filter {
+                it.status == JobStatus.ERROR && it.retryCount < MAX_AUTO_RETRIES && !running.containsKey(it.id)
+            }
+            if (candidates.isEmpty()) return@launch
+            addLog("Связь восстановлена — продолжаю ${candidates.size} загрузку(и) с места обрыва")
+            candidates.forEach { job ->
+                val i = jobs.indexOfFirst { it.id == job.id }
+                if (i >= 0) {
+                    jobs[i] = jobs[i].copy(
+                        status = JobStatus.QUEUED,
+                        message = "Автоматическое продолжение после обрыва связи",
+                        retryCount = job.retryCount + 1
+                    )
+                }
+                launchJob(job.id)
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ поиск архива
 
     fun search() {
@@ -283,35 +308,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------------ загрузки
 
-    /** Скачать один найденный файл: сразу встаёт в очередь и стартует. */
+    /**
+     * Скачать один найденный файл. Если эта запись уже когда-то начинала скачиваться
+     * (ошибка или отмена), продолжает тот же файл с места остановки, а не с начала.
+     */
     fun downloadFile(r: RecordItem) {
         if (!connected) {
             message = "Сначала подключитесь к регистратору"
             return
         }
-        addJob(r.camera, r.start, r.end)
-    }
-
-    /** Скачать период из формы. */
-    fun downloadPeriod() {
-        if (!connected) {
-            message = "Сначала подключитесь к регистратору"
+        val existing = jobs.firstOrNull { it.deviceFile == r.name }
+        if (existing != null) {
+            if (existing.active) {
+                message = "Эта запись уже в загрузках"
+                return
+            }
+            message = if (existing.status == JobStatus.DONE) "Скачивание заново" else "Продолжаю докачку"
+            retryJob(existing.id)
             return
         }
-        val q = buildQuery() ?: return
-        addJob(q.channel0 + 1, q.from.format(dateTimeFmt), q.to.format(dateTimeFmt))
-    }
-
-    private fun addJob(camera: Int, from: String, to: String) {
-        val dup = jobs.any {
-            it.camera == camera && it.from == from && it.to == to &&
-                it.status != JobStatus.ERROR && it.status != JobStatus.CANCELED
-        }
-        if (dup) {
-            message = "Эта запись уже в загрузках"
-            return
-        }
-        val job = DownloadJob(camera = camera, from = from, to = to)
+        val job = DownloadJob(camera = r.camera, from = r.start, to = r.end, deviceFile = r.name)
         jobs.add(0, job)
         message = "Добавлено в загрузки"
         launchJob(job.id)
@@ -328,14 +344,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Повторить вручную: продолжит докачку с уже скачанного места, а не с начала. */
     fun retryJob(id: String) {
         if (!connected) {
             message = "Сначала подключитесь к регистратору"
             return
         }
         update(id) {
-            if (it.status == JobStatus.ERROR || it.status == JobStatus.CANCELED) {
-                it.copy(status = JobStatus.QUEUED, progress = 0, message = "")
+            if (!it.active) {
+                // DONE сбрасывается на скачивание заново (временный файл уже удалён при успехе),
+                // ERROR/CANCELED продолжат с того места, где остался временный файл.
+                val progress = if (it.status == JobStatus.DONE) 0 else it.progress
+                it.copy(status = JobStatus.QUEUED, message = "", progress = progress)
             } else it
         }
         launchJob(id)
@@ -343,39 +363,52 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun removeJob(id: String) {
         if (running.containsKey(id)) return
+        tempDavFile(id).delete()
+        tempMp4File(id).delete()
         jobs.removeAll { it.id == id }
     }
 
     fun clearFinished() {
+        val toRemove = jobs.filter { !it.active }
+        toRemove.forEach {
+            tempDavFile(it.id).delete()
+            tempMp4File(it.id).delete()
+        }
         jobs.removeAll { !it.active }
     }
+
+    private fun tempDavFile(id: String): File =
+        File(Storage.tempDir(getApplication()), "$id.dav")
+
+    private fun tempMp4File(id: String): File =
+        File(Storage.tempDir(getApplication()), "$id.mp4")
 
     private fun launchJob(id: String) {
         if (running.containsKey(id)) return
         val sem = semaphore
         val c = viewModelScope.launch(start = CoroutineStart.LAZY) {
             val ctx = getApplication<Application>()
-            var dav: File? = null
-            var mp4: File? = null
             try {
                 sem.withPermit {
                     val job = jobs.firstOrNull { it.id == id } ?: return@withPermit
                     if (job.status != JobStatus.QUEUED) return@withPermit
-                    val from = NetSdk.parseDateTime(job.from)
-                    val to = NetSdk.parseDateTime(job.to)
-                    val tmpDir = Storage.tempDir(ctx)
-                    val tmpDav = File(tmpDir, "$id.dav")
-                    dav = tmpDav
+                    val tmpDav = tempDavFile(id)
+                    val resuming = tmpDav.exists() && tmpDav.length() > 0
 
                     update(id) {
-                        it.copy(status = JobStatus.RUNNING, progress = 0, message = "Скачивание с регистратора…")
+                        it.copy(
+                            status = JobStatus.RUNNING,
+                            message = if (resuming) "Продолжаю с ${tmpDav.length() / 1024 / 1024} МБ…"
+                            else "Скачивание с регистратора…"
+                        )
                     }
-                    addLog("Старт: ${job.title}")
+                    addLog(
+                        (if (resuming) "Продолжение: " else "Старт: ") + job.title +
+                            if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else ""
+                    )
                     withContext(Dispatchers.IO) {
-                        NetSdk.downloadByTime(
-                            loginHandle, job.camera - 1,
-                            NetSdk.netTime(from), NetSdk.netTime(to), tmpDav
-                        ) { pct ->
+                        NetSdk.downloadFilePiece(loginHandle, job.deviceFile, tmpDav) { done, total ->
+                            val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
                             viewModelScope.launch(Dispatchers.Main.immediate) {
                                 update(id) { it.copy(progress = pct) }
                             }
@@ -390,8 +423,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         update(id) {
                             it.copy(status = JobStatus.CONVERTING, progress = 100, message = "Конвертация в MP4…")
                         }
-                        val out = File(tmpDir, "$id.mp4")
-                        mp4 = out
+                        val out = tempMp4File(id)
                         val err = withContext(Dispatchers.IO) { Mp4Converter.convert(tmpDav, out) }
                         if (err == null) {
                             exportFile = out
@@ -417,11 +449,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     }
                     addLog("Готово: $shown")
+                    // Временные файлы больше не нужны только при успехе — докачка завершена.
+                    tmpDav.delete()
+                    tempMp4File(id).delete()
                 }
             } catch (e: CancellationException) {
-                update(id) { it.copy(status = JobStatus.CANCELED, message = "Отменено") }
+                // Частичный файл НЕ удаляем: это и есть точка, с которой продолжит докачка.
+                update(id) { it.copy(status = JobStatus.CANCELED, message = "Остановлено, можно продолжить") }
                 throw e
             } catch (e: SdkException) {
+                // Частичный файл тоже остаётся — для докачки после «Повторить» или авто-продолжения.
                 update(id) { it.copy(status = JobStatus.ERROR, message = e.message ?: "Ошибка") }
                 addLog("Ошибка задания: ${e.message}")
             } catch (e: Throwable) {
@@ -430,8 +467,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 addLog("Сбой задания: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
-                dav?.delete()
-                mp4?.delete()
                 running.remove(id)
             }
         }
@@ -482,6 +517,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         val h = loginHandle
         running.values.forEach { it.cancel() }
+        NetSdk.onReconnect = null
         if (h != 0L) {
             Thread {
                 try {
