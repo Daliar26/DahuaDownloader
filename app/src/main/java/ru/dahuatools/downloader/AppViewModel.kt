@@ -124,7 +124,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     )
                 }
-            }.filter { it.deviceFile.isNotBlank() && it.from.isNotBlank() && it.to.isNotBlank() }
+            }.filter { it.from.isNotBlank() && it.to.isNotBlank() }
         } catch (e: Exception) {
             emptyList()
         }
@@ -402,6 +402,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * Скачать один найденный файл. Если эта запись уже когда-то начинала скачиваться
      * (ошибка или отмена), продолжает тот же файл с места остановки, а не с начала.
      */
+    /** Добавить одну задачу на весь выбранный интервал, не на каждый сегмент архива. */
+    fun downloadInterval() {
+        if (!connected) {
+            message = "Сначала подключитесь к регистратору"
+            return
+        }
+        val q = buildQuery() ?: return
+        val fromText = q.from.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        val toText = q.to.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+        val marker = "__DOWNLOAD_BY_TIME__"
+        val existing = jobs.firstOrNull {
+            it.deviceFile == marker && it.camera == q.channel0 + 1 &&
+                it.from == fromText && it.to == toText
+        }
+        if (existing != null) {
+            if (existing.active) {
+                message = "Этот интервал уже в загрузках"
+                return
+            }
+            retryJob(existing.id)
+            return
+        }
+        val job = DownloadJob(
+            camera = q.channel0 + 1, from = fromText, to = toText, deviceFile = marker
+        )
+        jobs.add(0, job)
+        persistJobs()
+        message = "Интервал добавлен в загрузки"
+        launchJob(job.id)
+    }
+
     fun downloadFile(r: RecordItem) {
         if (!connected) {
             message = "Сначала подключитесь к регистратору"
@@ -486,7 +517,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val job = jobs.firstOrNull { it.id == id } ?: return@withPermit
                     if (job.status != JobStatus.QUEUED) return@withPermit
                     val tmpDav = tempDavFile(id)
-                    val resuming = tmpDav.exists() && tmpDav.length() > 0
+                    val byTime = job.deviceFile == "__DOWNLOAD_BY_TIME__"
+                    val resuming = !byTime && tmpDav.exists() && tmpDav.length() > 0
 
                     update(id) {
                         it.copy(
@@ -497,13 +529,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     addLog(
                         (if (resuming) "Продолжение: " else "Старт: ") + job.title +
-                            if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else ""
+                            if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else if (byTime) " (единый файл за интервал)" else ""
                     )
                     withContext(Dispatchers.IO) {
-                        NetSdk.downloadFilePiece(loginHandle, job.deviceFile, tmpDav) { done, total ->
-                            val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
-                            viewModelScope.launch(Dispatchers.Main.immediate) {
-                                update(id) { it.copy(progress = pct) }
+                        if (byTime) {
+                            NetSdk.downloadByTime(
+                                loginHandle, job.camera - 1,
+                                NetSdk.parseDateTime(job.from), NetSdk.parseDateTime(job.to), tmpDav
+                            ) { done, total ->
+                                val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
+                                viewModelScope.launch(Dispatchers.Main.immediate) {
+                                    update(id) { it.copy(progress = pct) }
+                                }
+                            }
+                        } else {
+                            NetSdk.downloadFilePiece(loginHandle, job.deviceFile, tmpDav) { done, total ->
+                                val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
+                                viewModelScope.launch(Dispatchers.Main.immediate) {
+                                    update(id) { it.copy(progress = pct) }
+                                }
                             }
                         }
                     }
