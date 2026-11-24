@@ -44,6 +44,13 @@ The exact method names and lifecycle must be implemented against the version of 
 - Test initialization, offline device handling, timeout, reconnect, logout, and cleanup on the target Android ABI.
 - Preserve the existing direct-IP login path as a fallback.
 
+## Additional maintenance work on the integration branch
+
+- Download queue entries are now persisted in app preferences.
+- Partial DAV files are no longer deleted during application startup, so an interrupted download can be retried after restarting the app.
+- Interrupted active jobs are restored in an error/retryable state; the user must reconnect to the recorder and tap Retry.
+- The Android build workflow now declares a pull-request trigger. The workflow has not yet been confirmed green for this branch.
+
 ## Current result
 
-This change documents the verified integration prerequisites only. It does not claim that P2P connectivity is implemented or working. Functional P2P work should begin only after the official matching SDK artifact and authorized configuration are available.
+This branch includes application reliability fixes and documentation, but it does not claim that P2P connectivity is implemented or working. Functional P2P work remains blocked until the official matching SDK artifact and authorized service configuration are supplied by Dahua. Do not merge this branch as a completed P2P feature.
