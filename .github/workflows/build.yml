@@ -60,7 +60,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
           go install golang.org/x/mobile/cmd/gomobile@latest
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
