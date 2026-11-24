@@ -257,6 +257,110 @@ object NetSdk {
         }
     }
 
+    /**
+     * Скачивает весь выбранный интервал одним файлом через Dahua DownloadByTimeEx.
+     * SDK выполняет передачу асинхронно; callback удерживается до StopDownload.
+     */
+    fun downloadByTime(
+        login: Long,
+        channel0: Int,
+        from: LocalDateTime,
+        to: LocalDateTime,
+        target: File,
+        onProgress: (done: Long, total: Long) -> Unit
+    ) {
+        target.parentFile?.mkdirs()
+        target.delete() // DownloadByTimeEx не поддерживает продолжение по байтовому смещению.
+        val api = INetSDK::class.java
+        val download = api.methods.firstOrNull {
+            it.name == "DownloadByTimeEx" && it.parameterTypes.size == 11
+        } ?: throw SdkException("В установленном INetSDK отсутствует DownloadByTimeEx с ожидаемой сигнатурой")
+
+        val callbackType = download.parameterTypes[6]
+        if (!callbackType.isInterface) {
+            throw SdkException("Неизвестный тип callback DownloadByTimeEx: ${callbackType.name}")
+        }
+        val finished = java.util.concurrent.CountDownLatch(1)
+        val totalRef = java.util.concurrent.atomic.AtomicLong(-1L)
+        val doneRef = java.util.concurrent.atomic.AtomicLong(0L)
+        val callback = java.lang.reflect.Proxy.newProxyInstance(
+            callbackType.classLoader, arrayOf(callbackType)
+        ) { proxy, called, args ->
+            when (called.name) {
+                "toString" -> "DahuaTimeDownloadCallback"
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals" -> proxy === args?.getOrNull(0)
+                else -> {
+                    val values = args ?: emptyArray()
+                    // Dahua callback: handle, total bytes, downloaded bytes, index, file info, user.
+                    if (values.size >= 3) {
+                        val total = (values[1] as? Number)?.toLong()?.and(0xFFFFFFFFL) ?: -1L
+                        val done = (values[2] as? Number)?.toLong()?.and(0xFFFFFFFFL) ?: 0L
+                        if (total >= 0) totalRef.set(total)
+                        doneRef.set(done)
+                        onProgress(done, totalRef.get())
+                        if (total > 0 && done >= total) finished.countDown()
+                    }
+                    null
+                }
+            }
+        }
+
+        val args = arrayOfNulls<Any>(11)
+        args[0] = login
+        args[1] = channel0
+        args[2] = 0 // EM_RECORD_TYPE_ALL
+        args[3] = netTime(from)
+        args[4] = netTime(to)
+        args[5] = target.absolutePath
+        args[6] = callback
+        args[7] = 0L
+        args[8] = null
+        args[9] = 0L
+        args[10] = null
+
+        val handle = try {
+            (download.invoke(null, *args) as? Number)?.toLong() ?: 0L
+        } catch (e: Throwable) {
+            throw SdkException("DownloadByTimeEx: ${e.cause?.message ?: e.message}; SDK ${lastError()}")
+        }
+        if (handle == 0L) {
+            throw SdkException("DownloadByTimeEx не запустился (SDK ${lastError()})")
+        }
+
+        val startedAt = System.currentTimeMillis()
+        var lastBytes = -1L
+        var lastChangeAt = startedAt
+        try {
+            while (!finished.await(250, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                currentCoroutineContext().ensureActive()
+                val done = doneRef.get()
+                if (done != lastBytes) {
+                    lastBytes = done
+                    lastChangeAt = System.currentTimeMillis()
+                }
+                if (System.currentTimeMillis() - lastChangeAt > 120_000L) {
+                    throw SdkException("Нет данных от регистратора более 2 минут (SDK ${lastError()})")
+                }
+                if (System.currentTimeMillis() - startedAt > 4 * 60 * 60 * 1000L) {
+                    throw SdkException("Превышено время загрузки интервала")
+                }
+            }
+            if (!target.exists() || target.length() == 0L) {
+                throw SdkException("Регистратор завершил выгрузку, но файл пустой (SDK ${lastError()})")
+            }
+            onProgress(target.length(), target.length())
+        } finally {
+            try {
+                val stop = api.methods.firstOrNull {
+                    it.name == "StopDownload" && it.parameterTypes.size == 1
+                }
+                stop?.invoke(null, handle)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     fun netTime(dt: LocalDateTime): NET_TIME {
         val r = NET_TIME()
         r.dwYear = dt.year.toLong()
