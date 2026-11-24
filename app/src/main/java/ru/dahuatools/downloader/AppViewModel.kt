@@ -19,6 +19,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -85,12 +87,65 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var semaphore = Semaphore(parallel)
 
     init {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                Storage.cleanTemp(app)
-            } catch (e: Exception) {
-                // не критично
+        // Не удаляем временные DAV-файлы при запуске: они нужны для продолжения загрузки.
+        jobs.addAll(loadPersistedJobs())
+    }
+
+    private fun loadPersistedJobs(): List<DownloadJob> {
+        val raw = prefs.getString("download_jobs", null) ?: return emptyList()
+        return try {
+            val array = JSONArray(raw)
+            buildList {
+                for (i in 0 until array.length()) {
+                    val item = array.optJSONObject(i) ?: continue
+                    val savedStatus = runCatching {
+                        JobStatus.valueOf(item.optString("status", JobStatus.ERROR.name))
+                    }.getOrDefault(JobStatus.ERROR)
+                    val interrupted = savedStatus == JobStatus.QUEUED ||
+                        savedStatus == JobStatus.RUNNING || savedStatus == JobStatus.CONVERTING
+                    add(
+                        DownloadJob(
+                            id = item.optString("id").takeIf { it.isNotBlank() }
+                                ?: java.util.UUID.randomUUID().toString(),
+                            camera = item.optInt("camera", 1).coerceIn(1, 4),
+                            from = item.optString("from"),
+                            to = item.optString("to"),
+                            deviceFile = item.optString("deviceFile"),
+                            status = if (interrupted) JobStatus.ERROR else savedStatus,
+                            progress = item.optInt("progress", 0).coerceIn(0, 100),
+                            message = if (interrupted) {
+                                "Приложение было перезапущено. Подключитесь к регистратору и нажмите «Повторить»."
+                            } else item.optString("message"),
+                            retryCount = item.optInt("retryCount", 0).coerceAtLeast(0)
+                        )
+                    )
+                }
+            }.filter { it.deviceFile.isNotBlank() && it.from.isNotBlank() && it.to.isNotBlank() }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun persistJobs() {
+        try {
+            val array = JSONArray()
+            jobs.forEach { job ->
+                array.put(
+                    JSONObject()
+                        .put("id", job.id)
+                        .put("camera", job.camera)
+                        .put("from", job.from)
+                        .put("to", job.to)
+                        .put("deviceFile", job.deviceFile)
+                        .put("status", job.status.name)
+                        .put("progress", job.progress)
+                        .put("message", job.message)
+                        .put("retryCount", job.retryCount)
+                )
             }
+            prefs.edit().putString("download_jobs", array.toString()).apply()
+        } catch (_: Exception) {
+            // Ошибка сохранения очереди не должна останавливать загрузку.
         }
     }
 
@@ -261,6 +316,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 launchJob(job.id)
             }
+            persistJobs()
         }
     }
 
@@ -329,6 +385,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         val job = DownloadJob(camera = r.camera, from = r.start, to = r.end, deviceFile = r.name)
         jobs.add(0, job)
+        persistJobs()
         message = "Добавлено в загрузки"
         launchJob(job.id)
     }
@@ -366,6 +423,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         tempDavFile(id).delete()
         tempMp4File(id).delete()
         jobs.removeAll { it.id == id }
+        persistJobs()
     }
 
     fun clearFinished() {
@@ -375,6 +433,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             tempMp4File(it.id).delete()
         }
         jobs.removeAll { !it.active }
+        persistJobs()
     }
 
     private fun tempDavFile(id: String): File =
@@ -478,7 +537,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun update(id: String, f: (DownloadJob) -> DownloadJob) {
         val i = jobs.indexOfFirst { it.id == id }
-        if (i >= 0) jobs[i] = f(jobs[i])
+        if (i >= 0) {
+            jobs[i] = f(jobs[i])
+            persistJobs()
+        }
     }
 
     private class Query(val channel0: Int, val from: LocalDateTime, val to: LocalDateTime)
@@ -515,6 +577,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        persistJobs()
         val h = loginHandle
         running.values.forEach { it.cancel() }
         NetSdk.onReconnect = null
