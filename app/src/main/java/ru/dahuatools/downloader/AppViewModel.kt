@@ -238,22 +238,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun connect() {
         if (busy || connected) return
         val p = port.trim().toIntOrNull()
-        if (ip.isBlank() || p == null || p !in 1..65535 || user.isBlank() || password.isEmpty()) {
-            status = "Заполните адрес, порт, логин и пароль"
+        if (user.isBlank() || password.isEmpty() ||
+            (p2pEnabled && p2pSerial.isBlank()) ||
+            (!p2pEnabled && (ip.isBlank() || p == null || p !in 1..65535))) {
+            status = if (p2pEnabled) "Укажите серийный номер, логин и пароль" else
+                "Заполните адрес, порт, логин и пароль"
             return
         }
-        val host = ip.trim()
+        val useP2p = p2pEnabled
+        val host = if (useP2p) "127.0.0.1" else ip.trim()
+        val connectPort = if (useP2p) 37778 else p!!
+        val serial = p2pSerial.trim()
         val login = user.trim()
         val pass = password
         busy = true
-        status = "Подключение…"
+        status = if (useP2p) "Подключение через Dahua P2P…" else "Подключение…"
         viewModelScope.launch {
             try {
                 val info = withContext(Dispatchers.IO) {
+                    if (useP2p) {
+                        val p2pError = P2pBridge.start(serial, login, pass, 37778, 37777)
+                        if (p2pError.isNotBlank()) throw SdkException(p2pError)
+                        p2pStarted = true
+                        addLog("P2P-туннель установлен; проверяю соединение NetSDK")
+                    }
                     NetSdk.onEvent = { addLog(it) }
                     NetSdk.onReconnect = { onConnectionRestored() }
                     NetSdk.ensureInit { addLog(it) }
-                    NetSdk.login(host, p, login, pass)
+                    NetSdk.login(host, connectPort, login, pass)
                 }
                 loginHandle = info.handle
                 connected = true
