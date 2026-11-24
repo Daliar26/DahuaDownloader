@@ -275,9 +275,19 @@ private fun ConnectionTab(vm: AppViewModel) {
         item {
             AppCard {
                 Text("Регистратор", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Field(vm.ip, { vm.ip = it }, "Адрес: IP или доменное имя", enabled = !vm.connected)
-                Field(vm.port, { vm.port = it }, "Порт (по умолчанию 37777)",
-                    keyboard = KeyboardType.Number, enabled = !vm.connected)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Подключение через Dahua P2P (тест)", modifier = Modifier.weight(1f))
+                    Switch(checked = vm.p2pEnabled, onCheckedChange = { vm.setP2pEnabled(it) },
+                        enabled = !vm.connected && !vm.busy)
+                }
+                if (vm.p2pEnabled) {
+                    Field(vm.p2pSerial, { vm.p2pSerial = it }, "Серийный номер (SN)", enabled = !vm.connected)
+                    Hint("P2P использует серийный номер и учётные данные регистратора. Совместимость порта 37777 зависит от модели и прошивки.")
+                } else {
+                    Field(vm.ip, { vm.ip = it }, "Адрес: IP или доменное имя", enabled = !vm.connected)
+                    Field(vm.port, { vm.port = it }, "Порт (по умолчанию 37777)",
+                        keyboard = KeyboardType.Number, enabled = !vm.connected)
+                }
                 Field(vm.user, { vm.user = it }, "Логин", enabled = !vm.connected)
                 Field(vm.password, { vm.password = it }, "Пароль", password = true, enabled = !vm.connected)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
