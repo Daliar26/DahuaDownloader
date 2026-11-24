@@ -277,7 +277,7 @@ private fun ConnectionTab(vm: AppViewModel) {
                 Text("Регистратор", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Подключение через Dahua P2P (тест)", modifier = Modifier.weight(1f))
-                    Switch(checked = vm.p2pEnabled, onCheckedChange = { vm.setP2pEnabled(it) },
+                    Switch(checked = vm.p2pEnabled, onCheckedChange = { vm.setP2pMode(it) },
                         enabled = !vm.connected && !vm.busy)
                 }
                 if (vm.p2pEnabled) {
