@@ -273,8 +273,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 deviceInfo = "Каналов: ${info.channels}, SN: ${info.serial}" +
                     (info.deviceTime?.let { ", время устройства: $it" } ?: "")
                 password = ""
-                prefs.edit().putString("ip", host).putString("port", p.toString())
-                    .putString("user", login).apply()
+                prefs.edit().putString("user", login).apply()
+                if (useP2p) {
+                    prefs.edit().putString("p2p_serial", serial).apply()
+                } else {
+                    prefs.edit().putString("ip", host).putString("port", connectPort.toString()).apply()
+                }
                 addLog("Вход выполнен. $deviceInfo")
                 tab = 1
             } catch (e: CancellationException) {
@@ -302,6 +306,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 withContext(Dispatchers.IO) {
                     toStop.joinAll()
                     NetSdk.logout(h)
+                    if (p2pStarted) {
+                        P2pBridge.stop()
+                        p2pStarted = false
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -603,10 +611,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val h = loginHandle
         running.values.forEach { it.cancel() }
         NetSdk.onReconnect = null
-        if (h != 0L) {
+        if (h != 0L || p2pStarted) {
             Thread {
                 try {
-                    NetSdk.logout(h)
+                    if (h != 0L) NetSdk.logout(h)
+                    if (p2pStarted) P2pBridge.stop()
                 } catch (ex: Throwable) {
                     // выход при закрытии приложения: ошибку показать некуда
                 }
