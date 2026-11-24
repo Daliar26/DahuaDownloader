@@ -1,56 +1,40 @@
 # Dahua P2P integration status
 
-## Repository audit
+## Current implementation
 
-The current Android app contains a NetSDK wrapper that logs in using an IP address and TCP port. The P2P proxy layer is not yet wired into the app.
+The Android app now has an optional experimental P2P mode.
 
-At the time of this audit:
+- Open-source transport: `github.com/blackjid/dahua-p2p`, pinned in `p2pbridge/go.mod`.
+- License: MIT; see `p2pbridge/THIRD_PARTY_NOTICES.md`.
+- The Go component is exposed to Android through a gomobile-generated AAR during GitHub Actions.
+- The app starts a P2P session using the recorder serial number and the recorder's own username/password.
+- A loopback TCP bridge listens on `127.0.0.1:37778` and attempts to tunnel to recorder TCP port `37777`.
+- Existing NetSDK login, archive search, and piece-download code is retained; direct IP mode remains available.
+- P2P is stopped after failed login, logout, and app shutdown.
 
-- `app/libs/INetSDK.jar` is referenced by Gradle.
-- `app/src/main/jniLibs/arm64-v8a/libToUProxy.so` is present in the repository.
-- `app/libs/libToUProxy.jar` is absent.
-- `app/build.gradle.kts` does not declare the P2P proxy JAR.
-- The current `NetSdk.login(...)` method accepts a host/IP and port; it does not create a P2P tunnel.
+## Important compatibility limitation
 
-## Why the P2P implementation is blocked
+The upstream Go project documents and tests its P2P transport primarily for RTSP. Its API can open a TCP realm to a specified port, but using that realm for Dahua NetSDK/DVRIP traffic on port 37777 is not confirmed by upstream documentation or by a test on the target recorder.
 
-The native proxy library alone does not provide the Java API used by the Android P2P client. The matching, vendor-supplied `libToUProxy.jar` (or the currently supported replacement from Dahua) is required to compile and call the proxy client.
+Therefore the in-app P2P switch is explicitly marked experimental. A successful P2P handshake alone does not prove that NetSDK login, archive search, or file download will work through the tunnel. Those operations must be verified on the target model and firmware. If the NetSDK login fails, turn off P2P and use the direct IP path over a trusted local network or VPN.
 
-The integration also needs the official P2P service configuration for the target SDK distribution, such as the server endpoint, port, and vendor-issued application key/identity where required. These values must come from Dahua or an authorized SDK package. They must not be guessed, copied from DMSS, or committed to the repository.
+## Build
 
-## Intended connection flow
+GitHub Actions installs Go, Android NDK, and gomobile, then builds `app/libs/dahua-p2p.aar` before Gradle builds the APK. The AAR is generated in CI and is not committed as a binary.
 
-1. Initialize the official Dahua P2P proxy client using the documented SDK API and authorized service configuration.
-2. Register the recorder serial number and the recorder's supported service port with the proxy client.
-3. Wait for the proxy to report a ready/online local forwarding port.
-4. Pass the local loopback address and forwarded port to the existing NetSDK login wrapper.
-5. Keep the existing archive search and piece-download implementation unchanged.
-6. Close the NetSDK login and P2P forwarding session on logout, cancellation, and application shutdown.
+## Security
 
-The exact method names and lifecycle must be implemented against the version of the official JAR actually supplied; do not assume API compatibility between SDK releases.
+- The bridge uses the user's own device serial number and credentials; it does not bypass device authentication.
+- Recorder passwords and session data are not written to source control.
+- No private DMSS/SmartPSS application keys or credentials are used.
+- For remote access fallback, use a VPN to the trusted network. Do not expose the recorder's TCP port directly to the public internet.
 
-## Required inputs before implementation
+## Validation still required
 
-- The official Dahua Android P2P proxy JAR matching the checked-in native library, or a complete current SDK package.
-- Vendor documentation for that exact SDK version.
-- Authorized P2P service endpoint and application credentials/configuration, supplied through a secure configuration mechanism rather than source control.
-- Confirmation that the recorder has P2P enabled and reports online in its own settings.
+- Green CI build for the latest branch head.
+- Install and test on an ARM64 Android device.
+- Verify P2P availability for the target serial number.
+- Verify that the P2P realm accepts port 37777 and that NetSDK login succeeds.
+- Verify archive search, partial download, reconnect, logout, and cleanup through P2P.
 
-## Security and validation requirements
-
-- Never log or commit recorder passwords, application keys, tokens, or private SDK files.
-- Do not reuse private DMSS/SmartPSS credentials or reverse-engineered service parameters.
-- Do not treat a successful local TCP connection as proof that the recorder login succeeded.
-- Test initialization, offline device handling, timeout, reconnect, logout, and cleanup on the target Android ABI.
-- Preserve the existing direct-IP login path as a fallback.
-
-## Additional maintenance work on the integration branch
-
-- Download queue entries are now persisted in app preferences.
-- Partial DAV files are no longer deleted during application startup, so an interrupted download can be retried after restarting the app.
-- Interrupted active jobs are restored in an error/retryable state; the user must reconnect to the recorder and tap Retry.
-- The Android build workflow now declares a pull-request trigger. The workflow has not yet been confirmed green for this branch.
-
-## Current result
-
-This branch includes application reliability fixes and documentation, but it does not claim that P2P connectivity is implemented or working. Functional P2P work remains blocked until the official matching SDK artifact and authorized service configuration are supplied by Dahua. Do not merge this branch as a completed P2P feature.
+Until those hardware checks pass, describe the app as a build candidate with experimental P2P support—not as a fully validated P2P release.
