@@ -366,6 +366,13 @@ private fun ArchiveTab(vm: AppViewModel) {
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("Найти") }
                 Hint(vm.message)
+                if (vm.found.isNotEmpty()) {
+                    Button(
+                        onClick = { vm.downloadInterval() },
+                        enabled = vm.connected,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Скачать весь интервал одним файлом") }
+                }
             }
         }
 
@@ -395,10 +402,7 @@ private fun ArchiveTab(vm: AppViewModel) {
                                 )
                                 Hint(String.format("%s · %.1f МБ", r.start.substringBefore(' '), r.sizeKb / 1024.0))
                             }
-                            Button(
-                                onClick = { vm.downloadFile(r) },
-                                enabled = vm.connected && !queued
-                            ) { Text(if (queued) "✓ В загрузках" else "⬇ Скачать") }
+                            Text(if (queued) "✓ В загрузках" else "Фрагмент")
                         }
                     }
                 }
