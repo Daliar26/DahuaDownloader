@@ -161,7 +161,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun setP2pEnabled(enabled: Boolean) {
+    fun setP2pMode(enabled: Boolean) {
         if (connected || busy) return
         p2pEnabled = enabled
         prefs.edit().putBoolean("p2p_enabled", enabled).apply()
