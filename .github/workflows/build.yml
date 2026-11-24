@@ -66,7 +66,7 @@ jobs:
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
           cd p2pbridge
-          go get golang.org/x/mobile@latest
+          go get -tool golang.org/x/mobile/cmd/gobind
           go mod tidy
           gomobile bind -v -target=android/arm64 -androidapi 26 -javapkg=ru.dahuatools.p2p -o ../app/libs/dahua-p2p.aar .
 
