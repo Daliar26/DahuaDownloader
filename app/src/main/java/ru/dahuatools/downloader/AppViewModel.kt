@@ -271,6 +271,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 connected = true
                 status = "Подключено"
                 deviceInfo = "Каналов: ${info.channels}, SN: ${info.serial}" +
+                    (if (useP2p) ", соединение: Dahua P2P" else ", соединение: IP") +
                     (info.deviceTime?.let { ", время устройства: $it" } ?: "")
                 password = ""
                 prefs.edit().putString("user", login).apply()
@@ -282,11 +283,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 addLog("Вход выполнен. $deviceInfo")
                 tab = 1
             } catch (e: CancellationException) {
+                if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
                 throw e
             } catch (e: SdkException) {
+                if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
                 status = e.message ?: "Ошибка"
                 addLog("Ошибка: ${e.message}")
             } catch (e: Throwable) {
+                if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
                 status = "Сбой: ${e.javaClass.simpleName}: ${e.message}"
                 addLog(status)
             } finally {
