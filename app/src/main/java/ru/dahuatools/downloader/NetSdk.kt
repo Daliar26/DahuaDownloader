@@ -261,7 +261,7 @@ object NetSdk {
      * Скачивает весь выбранный интервал одним файлом через Dahua DownloadByTimeEx.
      * SDK выполняет передачу асинхронно; callback удерживается до StopDownload.
      */
-    fun downloadByTime(
+    suspend fun downloadByTime(
         login: Long,
         channel0: Int,
         from: LocalDateTime,
