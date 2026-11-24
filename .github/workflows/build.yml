@@ -40,6 +40,11 @@ jobs:
           test "$size" -gt 1000000
           echo "Native libraries: $(find "$d" -maxdepth 1 -type f -name '*.so' | wc -l)"
 
+      - name: Set up Go for Dahua P2P bridge
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -49,7 +54,20 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018'
+
+      - name: Build Android P2P bridge (Go)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+          cd p2pbridge
+          go get golang.org/x/mobile@latest
+          go mod tidy
+          gomobile bind -v -target=android/arm64 -androidapi 26 -javapkg=ru.dahuatools.p2p -o ../app/libs/dahua-p2p.aar .
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
