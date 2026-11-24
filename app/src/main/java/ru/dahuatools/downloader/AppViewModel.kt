@@ -51,6 +51,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var port by mutableStateOf(prefs.getString("port", "37777") ?: "37777")
     var user by mutableStateOf(prefs.getString("user", "admin") ?: "admin")
     var password by mutableStateOf("")
+    var p2pEnabled by mutableStateOf(prefs.getBoolean("p2p_enabled", false))
+        private set
+    var p2pSerial by mutableStateOf(prefs.getString("p2p_serial", "") ?: "")
+    private var p2pStarted = false
     var connected by mutableStateOf(false)
         private set
     var busy by mutableStateOf(false)
@@ -155,6 +159,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             log.add(0, line)
             if (log.size > 200) log.removeAt(log.lastIndex)
         }
+    }
+
+    fun setP2pEnabled(enabled: Boolean) {
+        if (connected || busy) return
+        p2pEnabled = enabled
+        prefs.edit().putBoolean("p2p_enabled", enabled).apply()
     }
 
     fun updateParallel(n: Int) {
