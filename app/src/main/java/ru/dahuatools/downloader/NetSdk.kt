@@ -361,16 +361,18 @@ object NetSdk {
                     if (values.size >= 3) {
                         val totalRaw = (values[1] as? Number)?.toLong() ?: -1L
                         val doneRaw = (values[2] as? Number)?.toLong() ?: 0L
-                        if (doneRaw == -2L) {
-                            callbackError.set(true) // Dahua: failed / permission denied.
-                            trace("CALLBACK", "DownloadByTimeEx сообщил ошибку (-2)", true)
+                        // JNI может передать DWORD sentinel как signed -1/-2 либо как unsigned 32-bit.
+                        val doneUnsigned = doneRaw and 0xFFFFFFFFL
+                        if (doneUnsigned == 0xFFFFFFFEL) {
+                            callbackError.set(true) // Dahua: failed to write the output file.
+                            trace("CALLBACK", "DownloadByTimeEx сообщил ошибку записи (-2)", true)
                             finished.countDown()
-                        } else if (doneRaw == -1L) {
+                        } else if (doneUnsigned == 0xFFFFFFFFL) {
                             trace("CALLBACK", "DownloadByTimeEx сообщил завершение")
                             finished.countDown() // Dahua: completed sentinel.
                         } else {
                             val total = totalRaw and 0xFFFFFFFFL
-                            val done = doneRaw and 0xFFFFFFFFL
+                            val done = doneUnsigned
                             if (total > 0) totalRef.set(total)
                             doneRef.set(done)
                             val pct = if (totalRef.get() > 0) ((done * 100) / totalRef.get()).toInt().coerceIn(0, 100) else -1

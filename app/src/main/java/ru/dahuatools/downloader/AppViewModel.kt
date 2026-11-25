@@ -382,17 +382,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * туннель, создаёт новый и обязательно выполняет новый NetSDK login:
      * старый loginHandle привязан к прежнему TCP-соединению.
      */
-    private suspend fun ensureP2pSession() {
+    private suspend fun ensureP2pSession(forceReconnect: Boolean = false) {
         if (!p2pEnabled) return
         p2pReconnectMutex.withLock {
             val health = P2pBridge.health()
-            DiagnosticLog.write("INFO", "P2P/HEALTH", health)
-            if (P2pBridge.isRunning() && !health.contains("retired=true")) return@withLock
+            val bridgeDiagnostics = P2pBridge.diagnostics()
+            val healthy = P2pBridge.isRunning() &&
+                health.contains("closed=false") &&
+                health.contains("responsive15s=true") &&
+                health.contains("retired=false") &&
+                health.contains("bindFailures=0")
+            DiagnosticLog.write(
+                if (healthy) "INFO" else "WARN",
+                "P2P/HEALTH",
+                "healthy=$healthy; $health\n$bridgeDiagnostics"
+            )
+            // Не считаем туннель рабочим только потому, что Go-клиент ещё не пометил его закрытым.
+            // Проверяем фактические ответы устройства и отсутствие повторных ошибок BIND.
+            if (!forceReconnect && healthy) return@withLock
             if (p2pPassword.isBlank()) {
                 throw SdkException("P2P-туннель потерян. Нужен повторный вход: пароль не хранится на диске.")
             }
-            addLog("P2P: туннель потерян; выполняю переподключение и новый вход NetSDK")
-            DiagnosticLog.write("ERROR", "P2P/RECOVERY", "Туннель закрыт; начинаю однократное восстановление")
+            addLog("P2P: туннель недоступен или не отвечает; выполняю переподключение и новый вход NetSDK")
+            DiagnosticLog.write("ERROR", "P2P/RECOVERY", "Туннель unhealthy/forceReconnect=$forceReconnect; health=$health; начинаю восстановление")
             val oldHandle = loginHandle
             if (oldHandle != 0L) runCatching { NetSdk.logout(oldHandle) }
             P2pBridge.stop()
