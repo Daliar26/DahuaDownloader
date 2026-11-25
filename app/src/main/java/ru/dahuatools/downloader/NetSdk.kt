@@ -306,14 +306,16 @@ object NetSdk {
         // Android NetSDK Java demo uses the 9-argument DownloadByTimeEx overload.
         val overloads = api.methods.filter { it.name == "DownloadByTimeEx" }
         overloads.forEach { trace("API", methodInfo(it)) }
-        val download = api.methods.firstOrNull {
-            it.name == "DownloadByTimeEx" && it.parameterTypes.size == 9
-        } ?: throw SdkException(
-            "INetSDK не содержит DownloadByTimeEx(9 параметров). Найдены методы: " +
-                api.methods.filter { it.name.contains("DownloadByTime", ignoreCase = true) }
-                    .joinToString { m -> m.name + "(" + m.parameterTypes.joinToString { it.simpleName } + ")" }
-                    .ifBlank { "нет методов DownloadByTime" }
-        )
+        val download = api.methods
+            .filter { it.name == "DownloadByTimeEx" }
+            .sortedByDescending { it.parameterTypes.size }
+            .firstOrNull { it.parameterTypes.size == 11 || it.parameterTypes.size == 9 }
+            ?: throw SdkException(
+                "INetSDK не содержит DownloadByTimeEx(11/9 параметров). Найдены: " +
+                    api.methods.filter { it.name.contains("DownloadByTime", ignoreCase = true) }
+                        .joinToString { m -> methodInfo(m) }
+                        .ifBlank { "нет методов DownloadByTime" }
+            )
 
         if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
             val code = lastError()
