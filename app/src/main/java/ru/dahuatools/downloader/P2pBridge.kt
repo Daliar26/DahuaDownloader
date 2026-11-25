@@ -8,7 +8,7 @@ package ru.dahuatools.downloader
 object P2pBridge {
     private const val CLASS_NAME = "ru.dahuatools.p2p.p2pbridge.P2pbridge"
 
-    fun start(serial: String, username: String, password: String, localPort: Int, devicePort: Int = 0): String {
+    fun start(serial: String, username: String, password: String, localPort: Int, devicePort: Int): String {
         return try {
             val type = Class.forName(CLASS_NAME)
             val method = type.methods.firstOrNull {
