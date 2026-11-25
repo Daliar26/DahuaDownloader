@@ -59,9 +59,18 @@ object NetSdk {
 
     fun lastError(): String = String.format("0x%08X", INetSDK.GetLastError())
 
+    private fun trace(stage: String, message: String, failed: Boolean = false) {
+        DiagnosticLog.write(if (failed) "ERROR" else "INFO", "NETSDK/$stage", message)
+        onEvent?.invoke("[$stage] $message")
+    }
+
+    private fun methodInfo(m: java.lang.reflect.Method) =
+        "${m.name}(${m.parameterTypes.joinToString { it.name }}) static=${java.lang.reflect.Modifier.isStatic(m.modifiers)}"
+
     @Synchronized
     fun ensureInit(log: (String) -> Unit) {
-        if (initialized) return
+        if (initialized) { trace("INIT", "SDK уже инициализирован"); return }
+        trace("INIT", "Начало инициализации NetSDK")
 
         // Порядок важен: libssl зависит от libcrypto.so.1.0.0 (SONAME у libcrypto.so именно такой).
         val libs = listOf(
@@ -75,6 +84,7 @@ object NetSdk {
         for ((name, required) in libs) {
             try {
                 System.loadLibrary(name)
+                trace("INIT", "System.loadLibrary($name): OK")
                 log("lib$name.so загружена")
             } catch (e: UnsatisfiedLinkError) {
                 log("lib$name.so: ${e.message}")
@@ -97,7 +107,7 @@ object NetSdk {
         } catch (e: Throwable) {
             throw SdkException("INetSDK.Init: ${e.javaClass.simpleName}: ${e.message}")
         }
-        if (!ok) throw SdkException("INetSDK.Init вернул false")
+        if (!ok) { val code = lastError(); trace("INIT", "Init=false; SDK=$code", true); throw SdkException("INetSDK.Init вернул false (SDK $code)") }
 
         INetSDK.SetAutoReconnect(rc)
         INetSDK.SetConnectTime(5000, 1)
@@ -108,9 +118,12 @@ object NetSdk {
 
         initialized = true
         log("SDK инициализирован, версия ${INetSDK.GetSDKVersion()}")
+        trace("INIT", "Init успешно; версия=${INetSDK.GetSDKVersion()}")
+        INetSDK::class.java.methods.filter { it.name == "DownloadByTimeEx" || it.name == "SetDeviceMode" }.forEach { trace("API", methodInfo(it)) }
     }
 
     fun login(ip: String, port: Int, user: String, password: String): LoginInfo {
+        trace("LOGIN", "LoginWithHighLevelSecurity: $ip:$port; user=$user; пароль скрыт")
         val inp = NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY()
         putZ(ip, inp.szIP, "IP")
         putZ(user, inp.szUserName, "Логин")
@@ -122,6 +135,8 @@ object NetSdk {
         val out = NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY()
         val handle = INetSDK.LoginWithHighLevelSecurity(inp, out)
         if (handle == 0L) {
+            val code = lastError()
+            trace("LOGIN", "Login handle=0; nError=${out.nError}; SDK=$code", true)
             val di = out.stuDeviceInfo
             val left = if (di != null) (di.byLeftLogTimes.toInt() and 0xFF) else -1
             val extra = if (left in 0..9) ", осталось попыток до блокировки: $left" else ""
@@ -131,6 +146,7 @@ object NetSdk {
             )
         }
 
+        trace("LOGIN", "Login успешно; handle=$handle")
         val di = out.stuDeviceInfo
         val serial = String(di.sSerialNumber, Charsets.UTF_8).substringBefore('\u0000').trim()
         val time = NET_TIME()
@@ -156,6 +172,7 @@ object NetSdk {
         to: NET_TIME,
         limit: Int
     ): SearchResult {
+        trace("SEARCH", "FindFile: login=$login; channel0=$channel0; type=ALL; from=$from; to=$to; limit=$limit")
         // Dahua requires the recording stream type to be selected before archive
         // queries on some NVR firmware. Use the same mode as DownloadByTimeEx.
         if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
@@ -168,8 +185,10 @@ object NetSdk {
         )
         if (h == 0L) {
             val error = lastError() // capture immediately; later SDK calls overwrite it
+            trace("SEARCH", "FindFile вернул handle=0; SDK=$error", true)
             throw SdkException("FindFile вернул пустой handle (SDK $error)")
         }
+        trace("SEARCH", "FindFile handle=$h")
         val items = ArrayList<RecordItem>()
         var truncated = false
         try {
@@ -280,10 +299,13 @@ object NetSdk {
         target: File,
         onProgress: (done: Long, total: Long) -> Unit
     ) {
+        trace("BYTIME", "Старт: login=$login; channel0=$channel0; from=$from; to=$to; target=${target.absolutePath}")
         target.parentFile?.mkdirs()
         target.delete() // DownloadByTimeEx не поддерживает продолжение по байтовому смещению.
         val api = INetSDK::class.java
         // Android NetSDK Java demo uses the 9-argument DownloadByTimeEx overload.
+        val overloads = api.methods.filter { it.name == "DownloadByTimeEx" }
+        overloads.forEach { trace("API", methodInfo(it)) }
         val download = api.methods.firstOrNull {
             it.name == "DownloadByTimeEx" && it.parameterTypes.size == 9
         } ?: throw SdkException(
@@ -294,8 +316,11 @@ object NetSdk {
         )
 
         if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
-            throw SdkException("Не удалось установить основной поток записи (SDK ${lastError()})")
+            val code = lastError()
+            trace("BYTIME", "SetDeviceMode SDK_RECORD_STREAM_TYPE=false; SDK=$code", true)
+            throw SdkException("Не удалось установить основной поток записи (SDK $code)")
         }
+        trace("BYTIME", "SetDeviceMode SDK_RECORD_STREAM_TYPE=0 успешно; метод=${methodInfo(download)}")
 
         val callbackType = download.parameterTypes[6]
         if (!callbackType.isInterface) {
@@ -314,6 +339,7 @@ object NetSdk {
                 "equals" -> proxy === args?.getOrNull(0)
                 else -> {
                     val values = args ?: emptyArray()
+                    trace("CALLBACK", "${called.name}; argc=${values.size}; args=${values.joinToString { it?.toString()?.take(80) ?: "null" }}")
                     // Android Java callback: handle,total,downloaded,index,recordInfo.
                     if (values.size >= 3) {
                         val totalRaw = (values[1] as? Number)?.toLong() ?: -1L
@@ -349,14 +375,21 @@ object NetSdk {
         args[8] = null
 
         val handle = try {
+            trace("BYTIME", "Вызов DownloadByTimeEx с 9 аргументами; callbackIndex=6")
             (download.invoke(null, *args) as? Number)?.toLong() ?: 0L
         } catch (e: Throwable) {
-            throw SdkException("DownloadByTimeEx: ${e.cause?.message ?: e.message}; SDK ${lastError()}")
+            val code = lastError()
+            val cause = e.cause ?: e
+            trace("BYTIME", "Исключение: ${cause.javaClass.name}: ${cause.message}; SDK=$code", true)
+            throw SdkException("DownloadByTimeEx: ${cause.message}; SDK $code")
         }
         if (handle == 0L) {
-            throw SdkException("DownloadByTimeEx не запустился (SDK ${lastError()})")
+            val code = lastError()
+            trace("BYTIME", "DownloadByTimeEx вернул handle=0; SDK=$code", true)
+            throw SdkException("DownloadByTimeEx не запустился (SDK $code)")
         }
 
+        trace("BYTIME", "DownloadByTimeEx запущен; handle=$handle")
         val startedAt = System.currentTimeMillis()
         var lastBytes = -1L
         var lastChangeAt = startedAt
@@ -381,6 +414,7 @@ object NetSdk {
             if (!target.exists() || target.length() == 0L) {
                 throw SdkException("Регистратор завершил выгрузку, но файл пустой (SDK ${lastError()})")
             }
+            trace("BYTIME", "Успешно завершено; file=${target.absolutePath}; bytes=${target.length()}")
             onProgress(target.length(), target.length())
         } finally {
             try {
@@ -388,6 +422,7 @@ object NetSdk {
                     it.name == "StopDownload" && it.parameterTypes.size == 1
                 }
                 stop?.invoke(null, handle)
+                trace("BYTIME", "StopDownload(handle=$handle)")
             } catch (_: Throwable) {
             }
         }
