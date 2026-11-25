@@ -91,6 +91,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var semaphore = Semaphore(parallel)
 
     init {
+        DiagnosticLog.initialize(app)
+        addLog("Приложение запущено; восстановлено заданий: ${jobs.size}")
         // Не удаляем временные DAV-файлы при запуске: они нужны для продолжения загрузки.
         jobs.addAll(loadPersistedJobs())
     }
@@ -154,6 +156,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun addLog(msg: String) {
+        DiagnosticLog.write("INFO", "APP", msg)
         val line = "${LocalTime.now().format(logTime)} $msg"
         viewModelScope.launch(Dispatchers.Main.immediate) {
             log.add(0, line)
@@ -246,6 +249,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val useP2p = p2pEnabled
+        addLog("Подключение: режим=${if (useP2p) "P2P" else "прямой IP"}, адрес=${if (useP2p) "127.0.0.1" else ip.trim()}, порт=${if (useP2p) 37778 else p}, пользователь=$user")
+        if (useP2p) addLog("P2P: SN=${p2pSerial.trim()}, локальный порт 37778 -> порт регистратора 37777")
         val host = if (useP2p) "127.0.0.1" else ip.trim()
         val connectPort = if (useP2p) 37778 else p!!
         val serial = p2pSerial.trim()
@@ -257,6 +262,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val info = withContext(Dispatchers.IO) {
                     if (useP2p) {
+                        addLog("P2P: запуск моста; ожидаю локальный TCP-прокси")
                         val p2pError = P2pBridge.start(serial, login, pass, 37778, 37777)
                         if (p2pError.isNotBlank()) throw SdkException(p2pError)
                         p2pStarted = true
@@ -265,6 +271,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     NetSdk.onEvent = { addLog(it) }
                     NetSdk.onReconnect = { onConnectionRestored() }
                     NetSdk.ensureInit { addLog(it) }
+                    addLog("NetSDK: начинаю LoginWithHighLevelSecurity на $host:$connectPort")
                     NetSdk.login(host, connectPort, login, pass)
                 }
                 loginHandle = info.handle
@@ -281,6 +288,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     prefs.edit().putString("ip", host).putString("port", connectPort.toString()).apply()
                 }
                 addLog("Вход выполнен. $deviceInfo")
+                DiagnosticLog.write("INFO", "CONNECT", "Подключение завершено успешно; режим=${if (useP2p) "P2P" else "IP"}; каналы=${info.channels}; SN=${info.serial}; время регистратора=${info.deviceTime ?: "не получено"}")
                 tab = 1
             } catch (e: CancellationException) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
@@ -288,10 +296,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: SdkException) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
                 status = e.message ?: "Ошибка"
-                addLog("Ошибка: ${e.message}")
+                DiagnosticLog.write("ERROR", "CONNECT", "SdkException: ${e.message}")
+                addLog("Ошибка подключения: ${e.message}")
             } catch (e: Throwable) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
                 status = "Сбой: ${e.javaClass.simpleName}: ${e.message}"
+                DiagnosticLog.write("ERROR", "CONNECT", "Необработанное исключение ${e.javaClass.name}: ${e.message}")
                 addLog(status)
             } finally {
                 busy = false
@@ -368,6 +378,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         found.clear()
         viewModelScope.launch {
             try {
+                addLog("Поиск архива: канал=${q.channel0 + 1}, с=${q.from}, по=${q.to}")
                 val res = withContext(Dispatchers.IO) {
                     NetSdk.findRecordings(
                         loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
@@ -381,16 +392,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     res.truncated -> "Найдено файлов: ${res.items.size} (показаны первые 500)"
                     else -> "Найдено файлов: ${res.items.size}"
                 }
-                addLog(message)
+                addLog("$message; канал=${q.channel0 + 1}; период=${q.from}..${q.to}")
             } catch (e: CancellationException) {
                 throw e
             } catch (e: SdkException) {
                 message = if (NetSdk.lastError() == "0x80000181") {
                     "FindFile недоступен (NET_ERROR_GET_INSTANCE). Можно попробовать скачать выбранный интервал напрямую."
                 } else e.message ?: "Ошибка поиска"
+                DiagnosticLog.write("ERROR", "SEARCH", "Поиск завершился ошибкой: ${e.message}")
                 addLog("Ошибка поиска: ${e.message}")
             } catch (e: Throwable) {
                 message = "Сбой поиска: ${e.javaClass.simpleName}: ${e.message}"
+                DiagnosticLog.write("ERROR", "SEARCH", message)
                 addLog(message)
             } finally {
                 busy = false
@@ -432,6 +445,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         jobs.add(0, job)
         persistJobs()
         message = "Интервал добавлен в загрузки"
+        addLog("Создана задача единого интервала: ID=${job.id}, канал=${job.camera}, ${job.from}..${job.to}")
         launchJob(job.id)
     }
 
@@ -503,6 +517,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         persistJobs()
     }
 
+    fun exportDiagnosticLog(): String {
+        return try {
+            val ctx = getApplication<Application>()
+            val src = DiagnosticLog.file(ctx)
+            if (!src.exists() || src.length() == 0L) return "Журнал пока пуст"
+            val name = "Dahua_diagnostics_${java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())}.log"
+            val path = Storage.exportToDownloads(ctx, src, name, "text/plain")
+            addLog("Диагностический журнал сохранён: $path")
+            path
+        } catch (e: Throwable) {
+            DiagnosticLog.write("ERROR", "LOGGER", "Экспорт журнала: ${e.javaClass.name}: ${e.message}")
+            "Не удалось сохранить журнал: ${e.message}"
+        }
+    }
+
+    fun fullDiagnosticLog(): String = DiagnosticLog.read(getApplication())
+
     private fun tempDavFile(id: String): File =
         File(Storage.tempDir(getApplication()), "$id.dav")
 
@@ -529,6 +560,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             else "Скачивание с регистратора…"
                         )
                     }
+                    DiagnosticLog.write("INFO", "DOWNLOAD", "Задача ${job.id}: старт; режим=${if (byTime) "DownloadByTimeEx, один файл" else "DownloadPieceFile"}; канал=${job.camera}; период=${job.from}..${job.to}; файл=${tmpDav.absolutePath}; продолжение=$resuming")
                     addLog(
                         (if (resuming) "Продолжение: " else "Старт: ") + job.title +
                             if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else if (byTime) " (единый файл за интервал)" else ""
@@ -599,11 +631,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: SdkException) {
                 // Частичный файл тоже остаётся — для докачки после «Повторить» или авто-продолжения.
                 update(id) { it.copy(status = JobStatus.ERROR, message = e.message ?: "Ошибка") }
+                DiagnosticLog.write("ERROR", "DOWNLOAD", "Задача $id завершилась SdkException: ${e.message}; временный файл=${tempDavFile(id).absolutePath}; размер=${tempDavFile(id).length()}")
                 addLog("Ошибка задания: ${e.message}")
             } catch (e: Throwable) {
                 update(id) {
                     it.copy(status = JobStatus.ERROR, message = "Сбой: ${e.javaClass.simpleName}: ${e.message}")
                 }
+                DiagnosticLog.write("ERROR", "DOWNLOAD", "Задача $id: ${e.javaClass.name}: ${e.message}")
                 addLog("Сбой задания: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 running.remove(id)
