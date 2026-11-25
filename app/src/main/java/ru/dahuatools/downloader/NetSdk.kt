@@ -2,6 +2,7 @@ package ru.dahuatools.downloader
 
 import com.company.NetSDK.CB_fDisConnect
 import com.company.NetSDK.CB_fHaveReConnect
+import com.company.NetSDK.CB_fTimeDownLoadPosCallBack
 import com.company.NetSDK.CB_fSearchDevicesCB
 import com.company.NetSDK.EM_LOGIN_SPAC_CAP_TYPE
 import com.company.NetSDK.EM_QUERY_RECORD_TYPE
@@ -181,12 +182,6 @@ object NetSdk {
             throw SdkException("SetDeviceMode перед FindFile завершился ошибкой SDK $error")
         }
         trace("SEARCH", "SDK_RECORD_STREAM_TYPE=0 установлен")
-        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_TYPE, 0)) {
-            val error = lastError()
-            trace("SEARCH", "SDK_RECORD_TYPE=0 отклонён; SDK=$error", true)
-            throw SdkException("SetDeviceMode SDK_RECORD_TYPE перед FindFile: SDK $error")
-        }
-        trace("SEARCH", "SDK_RECORD_TYPE=0 установлен")
 
         val h = INetSDK.FindFile(
             login, channel0, EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL, null, from, to, false, 10000
@@ -309,120 +304,82 @@ object NetSdk {
     ) {
         trace("BYTIME", "Старт: login=$login; channel0=$channel0; from=$from; to=$to; target=${target.absolutePath}")
         target.parentFile?.mkdirs()
-        target.delete() // DownloadByTimeEx не поддерживает продолжение по байтовому смещению.
-        val api = INetSDK::class.java
-        // Prefer the documented 11-argument Java overload; retain 9-argument compatibility for older SDK JARs.
-        val overloads = api.methods.filter { it.name == "DownloadByTimeEx" }
-        overloads.forEach { trace("API", methodInfo(it)) }
-        val download = api.methods
-            .filter { it.name == "DownloadByTimeEx" }
-            .sortedByDescending { it.parameterTypes.size }
-            .firstOrNull { it.parameterTypes.size == 11 || it.parameterTypes.size == 9 }
-            ?: throw SdkException(
-                "INetSDK не содержит DownloadByTimeEx(11/9 параметров). Найдены: " +
-                    api.methods.filter { it.name.contains("DownloadByTime", ignoreCase = true) }
-                        .joinToString { m -> methodInfo(m) }
-                        .ifBlank { "нет методов DownloadByTime" }
-            )
+        target.delete()
 
+        // Используем ровно тот Android API, который вызывает официальный Dahua Demo:
+        // 9 параметров и штатный CB_fTimeDownLoadPosCallBack.
         if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
             val code = lastError()
             trace("BYTIME", "SetDeviceMode SDK_RECORD_STREAM_TYPE=false; SDK=$code", true)
             throw SdkException("Не удалось установить основной поток записи (SDK $code)")
         }
-        trace("BYTIME", "SDK_RECORD_STREAM_TYPE=0 установлен")
-        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_TYPE, 0)) {
-            val code = lastError()
-            trace("BYTIME", "SDK_RECORD_TYPE=false; SDK=$code", true)
-            throw SdkException("Не удалось установить тип записи (SDK $code)")
-        }
-        trace("BYTIME", "SDK_RECORD_TYPE=0 установлен; метод выбран")
 
-        val callbackType = download.parameterTypes[6]
-        if (!callbackType.isInterface) {
-            throw SdkException("Неизвестный тип callback DownloadByTimeEx: ${callbackType.name}")
-        }
         val finished = java.util.concurrent.CountDownLatch(1)
-        val totalRef = java.util.concurrent.atomic.AtomicLong(-1L)
-        val doneRef = java.util.concurrent.atomic.AtomicLong(0L)
+        val totalKbRef = java.util.concurrent.atomic.AtomicLong(-1L)
+        val doneKbRef = java.util.concurrent.atomic.AtomicLong(0L)
         val callbackError = java.util.concurrent.atomic.AtomicBoolean(false)
         val lastLoggedPercent = java.util.concurrent.atomic.AtomicInteger(-10)
-        val callback = java.lang.reflect.Proxy.newProxyInstance(
-            callbackType.classLoader, arrayOf(callbackType)
-        ) { proxy, called, args ->
-            when (called.name) {
-                "toString" -> "DahuaTimeDownloadCallback"
-                "hashCode" -> System.identityHashCode(proxy)
-                "equals" -> proxy === args?.getOrNull(0)
-                else -> {
-                    val values = args ?: emptyArray()
-                    // Не пишем каждый нативный callback синхронно на диск: SDK может вызывать их очень часто.
-                    // Android Java callback: handle,total,downloaded,index,recordInfo.
-                    if (values.size >= 3) {
-                        val totalRaw = (values[1] as? Number)?.toLong() ?: -1L
-                        val doneRaw = (values[2] as? Number)?.toLong() ?: 0L
-                        // JNI может передать DWORD sentinel как signed -1/-2 либо как unsigned 32-bit.
-                        val doneUnsigned = doneRaw and 0xFFFFFFFFL
-                        if (doneUnsigned == 0xFFFFFFFEL) {
-                            callbackError.set(true) // Dahua: failed to write the output file.
-                            trace("CALLBACK", "DownloadByTimeEx сообщил ошибку записи (-2)", true)
-                            finished.countDown()
-                        } else if (doneUnsigned == 0xFFFFFFFFL) {
-                            trace("CALLBACK", "DownloadByTimeEx сообщил завершение")
-                            finished.countDown() // Dahua: completed sentinel.
-                        } else {
-                            val total = totalRaw and 0xFFFFFFFFL
-                            val done = doneUnsigned
-                            if (total > 0) totalRef.set(total)
-                            doneRef.set(done)
-                            val pct = if (totalRef.get() > 0) ((done * 100) / totalRef.get()).toInt().coerceIn(0, 100) else -1
-                            val logged = lastLoggedPercent.get()
-                            if (pct >= 0 && pct / 10 > logged / 10 && lastLoggedPercent.compareAndSet(logged, pct)) {
-                                trace("CALLBACK", "Прогресс DownloadByTimeEx: ${pct}%")
-                            }
-                            onProgress(done, totalRef.get())
-                            if (total > 0 && done >= total) finished.countDown()
-                        }
+
+        // Сильная ссылка на callback живёт до StopDownload; никаких Proxy на границе JNI.
+        val callback = object : CB_fTimeDownLoadPosCallBack {
+            override fun invoke(
+                lPlayHandle: Long,
+                dwTotalSize: Int,
+                dwDownLoadSize: Int,
+                index: Int,
+                recordfileinfo: NET_RECORDFILE_INFO
+            ) {
+                when (dwDownLoadSize) {
+                    -2 -> {
+                        callbackError.set(true)
+                        trace("CALLBACK", "Dahua сообщил ошибку записи (-2)", true)
+                        finished.countDown()
                     }
-                    null
+                    -1 -> {
+                        trace("CALLBACK", "Dahua сообщил завершение загрузки")
+                        finished.countDown()
+                    }
+                    else -> {
+                        val totalKb = dwTotalSize.toLong().coerceAtLeast(0L)
+                        val doneKb = dwDownLoadSize.toLong().coerceAtLeast(0L)
+                        if (totalKb > 0) totalKbRef.set(totalKb)
+                        doneKbRef.set(doneKb)
+                        val totalKbNow = totalKbRef.get()
+                        val pct = if (totalKbNow > 0) {
+                            ((doneKb * 100L) / totalKbNow).toInt().coerceIn(0, 100)
+                        } else -1
+                        val logged = lastLoggedPercent.get()
+                        if (pct >= 0 && pct / 10 > logged / 10 &&
+                            lastLoggedPercent.compareAndSet(logged, pct)
+                        ) {
+                            trace("CALLBACK", "Прогресс DownloadByTimeEx: ${pct}%")
+                        }
+                        // Dahua передаёт размеры в КБ, наружу отдаём байты.
+                        onProgress(doneKb * 1024L, if (totalKbNow > 0) totalKbNow * 1024L else -1L)
+                    }
                 }
             }
         }
 
-        val args = arrayOfNulls<Any>(download.parameterTypes.size)
-        args[0] = login
-        args[1] = channel0
-        args[2] = EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL
-        args[3] = netTime(from)
-        args[4] = netTime(to)
-        args[5] = target.absolutePath
-        args[6] = callback
-        for (index in 7 until args.size) {
-            val type = download.parameterTypes[index]
-            args[index] = when {
-                !type.isPrimitive -> null
-                type == java.lang.Long.TYPE -> 0L
-                type == java.lang.Integer.TYPE -> 0
-                type == java.lang.Boolean.TYPE -> false
-                type == java.lang.Float.TYPE -> 0f
-                type == java.lang.Double.TYPE -> 0.0
-                type == java.lang.Short.TYPE -> 0.toShort()
-                type == java.lang.Byte.TYPE -> 0.toByte()
-                type == java.lang.Character.TYPE -> 0.toChar()
-                else -> null
-            }
-        }
-        trace("BYTIME", "Аргументы сформированы по типам параметров; callbackIndex=6")
-
         val handle = try {
-            trace("BYTIME", "Вызов DownloadByTimeEx; число аргументов=${args.size}; callbackIndex=6")
-            (download.invoke(null, *args) as? Number)?.toLong() ?: 0L
+            trace("BYTIME", "Вызов штатного DownloadByTimeEx(9 параметров)")
+            INetSDK.DownloadByTimeEx(
+                login,
+                channel0,
+                EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL,
+                netTime(from),
+                netTime(to),
+                target.absolutePath,
+                callback,
+                null,
+                null
+            )
         } catch (e: Throwable) {
             val code = lastError()
-            val cause = e.cause ?: e
-            trace("BYTIME", "Исключение: ${cause.javaClass.name}: ${cause.message}; SDK=$code", true)
-            throw SdkException("DownloadByTimeEx: ${cause.message}; SDK $code")
+            trace("BYTIME", "Вызов DownloadByTimeEx завершился исключением: ${e.javaClass.name}: ${e.message}; SDK=$code", true)
+            throw SdkException("DownloadByTimeEx: ${e.message}; SDK $code")
         }
+
         if (handle == 0L) {
             val code = lastError()
             trace("BYTIME", "DownloadByTimeEx вернул handle=0; SDK=$code", true)
@@ -436,7 +393,7 @@ object NetSdk {
         try {
             while (!finished.await(250, java.util.concurrent.TimeUnit.MILLISECONDS)) {
                 currentCoroutineContext().ensureActive()
-                val done = doneRef.get()
+                val done = doneKbRef.get()
                 if (done != lastBytes) {
                     lastBytes = done
                     lastChangeAt = System.currentTimeMillis()
@@ -449,7 +406,7 @@ object NetSdk {
                 }
             }
             if (callbackError.get()) {
-                throw SdkException("Регистратор отклонил выгрузку интервала (SDK ${lastError()})")
+                throw SdkException("Dahua не смог записать выходной файл (SDK ${lastError()})")
             }
             if (!target.exists() || target.length() == 0L) {
                 throw SdkException("Регистратор завершил выгрузку, но файл пустой (SDK ${lastError()})")
@@ -458,12 +415,10 @@ object NetSdk {
             onProgress(target.length(), target.length())
         } finally {
             try {
-                val stop = api.methods.firstOrNull {
-                    it.name == "StopDownload" && it.parameterTypes.size == 1
-                }
-                stop?.invoke(null, handle)
+                INetSDK.StopDownload(handle)
                 trace("BYTIME", "StopDownload(handle=$handle)")
-            } catch (_: Throwable) {
+            } catch (e: Throwable) {
+                trace("BYTIME", "StopDownload: ${e.javaClass.simpleName}: ${e.message}", true)
             }
         }
     }
