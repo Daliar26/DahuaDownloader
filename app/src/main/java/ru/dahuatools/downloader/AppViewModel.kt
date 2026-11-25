@@ -382,7 +382,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * туннель, создаёт новый и обязательно выполняет новый NetSDK login:
      * старый loginHandle привязан к прежнему TCP-соединению.
      */
-    private suspend fun ensureP2pSession(forceReconnect: Boolean = false) {
+    private suspend fun ensureP2pSession(
+        forceReconnect: Boolean = false,
+        staleHandle: Long? = null
+    ) {
         if (!p2pEnabled) return
         p2pReconnectMutex.withLock {
             val health = P2pBridge.health()
@@ -397,8 +400,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 "P2P/HEALTH",
                 "healthy=$healthy; $health\n$bridgeDiagnostics"
             )
+            // Если другая параллельная задача уже восстановила loginHandle, не рвём её новое соединение.
+            if (forceReconnect && staleHandle != null && loginHandle != staleHandle && healthy) {
+                DiagnosticLog.write("INFO", "P2P/RECOVERY", "Другой поток уже обновил loginHandle; повторное восстановление не требуется")
+                return@withLock
+            }
             // Не считаем туннель рабочим только потому, что Go-клиент ещё не пометил его закрытым.
-            // Проверяем фактические ответы устройства и отсутствие повторных ошибок BIND.
             if (!forceReconnect && healthy) return@withLock
             if (p2pPassword.isBlank()) {
                 throw SdkException("P2P-туннель потерян. Нужен повторный вход: пароль не хранится на диске.")
@@ -453,9 +460,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 addLog("Поиск архива: канал=${q.channel0 + 1}, с=${q.from}, по=${q.to}")
                 val res = withContext(Dispatchers.IO) {
                     ensureP2pSession()
-                    NetSdk.findRecordings(
-                        loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
-                    )
+                    val handleUsed = loginHandle
+                    try {
+                        NetSdk.findRecordings(
+                            handleUsed, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
+                        )
+                    } catch (e: SdkException) {
+                        val code = e.message.orEmpty()
+                        if (p2pEnabled && (code.contains("0x80000204") || code.contains("0x80000181"))) {
+                            DiagnosticLog.write("WARN", "SEARCH/RECOVERY", "FindFile failed on P2P handle=$handleUsed; one reconnect-and-retry: $code")
+                            ensureP2pSession(forceReconnect = true, staleHandle = handleUsed)
+                            NetSdk.findRecordings(
+                                loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
+                            )
+                        } else throw e
+                    }
                 }
                 found.addAll(res.items)
                 shownCount = 20
@@ -647,19 +666,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val progressLastPct = AtomicInteger(-1)
                     withContext(Dispatchers.IO) {
                         ensureP2pSession()
-                        if (byTime) {
-                            NetSdk.downloadByTime(
-                                loginHandle, job.camera - 1,
-                                NetSdk.parseDateTime(job.from), NetSdk.parseDateTime(job.to), tmpDav
-                            ) { done, total ->
-                                val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
-                                publishProgress(id, pct, progressLastAt, progressLastPct)
+                        suspend fun transfer(handle: Long) {
+                            if (byTime) {
+                                NetSdk.downloadByTime(
+                                    handle, job.camera - 1,
+                                    NetSdk.parseDateTime(job.from), NetSdk.parseDateTime(job.to), tmpDav
+                                ) { done, total ->
+                                    val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
+                                    publishProgress(id, pct, progressLastAt, progressLastPct)
+                                }
+                            } else {
+                                NetSdk.downloadFilePiece(handle, job.deviceFile, tmpDav) { done, total ->
+                                    val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
+                                    publishProgress(id, pct, progressLastAt, progressLastPct)
+                                }
                             }
-                        } else {
-                            NetSdk.downloadFilePiece(loginHandle, job.deviceFile, tmpDav) { done, total ->
-                                val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
-                                publishProgress(id, pct, progressLastAt, progressLastPct)
-                            }
+                        }
+                        val handleUsed = loginHandle
+                        try {
+                            transfer(handleUsed)
+                        } catch (e: SdkException) {
+                            if (p2pEnabled && e.message.orEmpty().contains("0x80000204")) {
+                                DiagnosticLog.write("WARN", "DOWNLOAD/RECOVERY", "SDK transport error on handle=$handleUsed; one P2P reconnect-and-retry: ${e.message}")
+                                ensureP2pSession(forceReconnect = true, staleHandle = handleUsed)
+                                transfer(loginHandle)
+                            } else throw e
                         }
                     }
 
