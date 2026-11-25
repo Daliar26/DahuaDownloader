@@ -2,7 +2,6 @@ package p2pbridge
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -44,7 +43,7 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 	if serial == "" || username == "" || password == "" {
 		return "Для P2P нужны серийный номер, логин и пароль регистратора"
 	}
-	if localPort < 1024 || localPort > 65535 || devicePort < 1 || devicePort > 65535 {
+	if localPort < 1024 || localPort > 65535 || devicePort < 0 || devicePort > 65535 {
 		return "Некорректный порт P2P"
 	}
 
@@ -62,8 +61,15 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 		return remember(fmt.Sprintf("Локальный порт P2P недоступен: %v", err))
 	}
 
+	rtspPort := client.RTSPPort()
+	if rtspPort == 0 {
+		rtspPort = uint32(devicePort)
+	}
+	if rtspPort == 0 {
+		rtspPort = 554
+	}
 	b := &bridge{
-		client: client, listener: listener, devicePort: uint32(devicePort),
+		client: client, listener: listener, devicePort: rtspPort,
 		done: make(chan struct{}), conns: make(map[net.Conn]struct{}),
 	}
 	stateMu.Lock()
@@ -202,4 +208,3 @@ func (b *bridge) handle(local net.Conn) {
 	<-errCh
 }
 
-var _ = errors.Is
