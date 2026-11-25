@@ -177,8 +177,16 @@ object NetSdk {
         // queries on some NVR firmware. Use the same mode as DownloadByTimeEx.
         if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
             val error = lastError()
+            trace("SEARCH", "SDK_RECORD_STREAM_TYPE=0 отклонён; SDK=$error", true)
             throw SdkException("SetDeviceMode перед FindFile завершился ошибкой SDK $error")
         }
+        trace("SEARCH", "SDK_RECORD_STREAM_TYPE=0 установлен")
+        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_TYPE, 0)) {
+            val error = lastError()
+            trace("SEARCH", "SDK_RECORD_TYPE=0 отклонён; SDK=$error", true)
+            throw SdkException("SetDeviceMode SDK_RECORD_TYPE перед FindFile: SDK $error")
+        }
+        trace("SEARCH", "SDK_RECORD_TYPE=0 установлен")
 
         val h = INetSDK.FindFile(
             login, channel0, EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL, null, from, to, false, 10000
@@ -322,7 +330,13 @@ object NetSdk {
             trace("BYTIME", "SetDeviceMode SDK_RECORD_STREAM_TYPE=false; SDK=$code", true)
             throw SdkException("Не удалось установить основной поток записи (SDK $code)")
         }
-        trace("BYTIME", "SetDeviceMode SDK_RECORD_STREAM_TYPE=0 успешно; метод=${methodInfo(download)}")
+        trace("BYTIME", "SDK_RECORD_STREAM_TYPE=0 установлен")
+        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_TYPE, 0)) {
+            val code = lastError()
+            trace("BYTIME", "SDK_RECORD_TYPE=false; SDK=$code", true)
+            throw SdkException("Не удалось установить тип записи (SDK $code)")
+        }
+        trace("BYTIME", "SDK_RECORD_TYPE=0 установлен; метод выбран")
 
         val callbackType = download.parameterTypes[6]
         if (!callbackType.isInterface) {
