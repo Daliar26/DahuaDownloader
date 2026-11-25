@@ -682,15 +682,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                 }
                             }
                         }
-                        val handleUsed = loginHandle
-                        try {
-                            transfer(handleUsed)
-                        } catch (e: SdkException) {
-                            if (p2pEnabled && e.message.orEmpty().contains("0x80000204")) {
-                                DiagnosticLog.write("WARN", "DOWNLOAD/RECOVERY", "SDK transport error on handle=$handleUsed; one P2P reconnect-and-retry: ${e.message}")
+                        var attempt = 0
+                        while (true) {
+                            val handleUsed = loginHandle
+                            try {
+                                transfer(handleUsed)
+                                break
+                            } catch (e: SdkException) {
+                                val errorText = e.message.orEmpty()
+                                val recoverableP2pFailure = p2pEnabled &&
+                                    (errorText.contains("0x80000204", ignoreCase = true) ||
+                                     errorText.contains("0x80000066", ignoreCase = true) ||
+                                     errorText.contains("Нет данных от регистратора более 2 минут", ignoreCase = true))
+                                if (!recoverableP2pFailure || attempt >= 1) throw e
+                                attempt++
+                                DiagnosticLog.write(
+                                    "WARN", "DOWNLOAD/RECOVERY",
+                                    "Передача оборвалась (attempt=$attempt, handle=$handleUsed): $errorText. " +
+                                        "Останавливаю старый поток, пересоздаю P2P и NetSDK login; затем повторю весь интервал."
+                                )
+                                addLog("Потеряна передача данных — восстанавливаю P2P и повторяю интервал (попытка $attempt/1)")
                                 ensureP2pSession(forceReconnect = true, staleHandle = handleUsed)
-                                transfer(loginHandle)
-                            } else throw e
+                                DiagnosticLog.write("INFO", "DOWNLOAD/RECOVERY", "P2P восстановлен; повтор DownloadByTimeEx/DownloadPieceFile с новым handle=$loginHandle")
+                            }
                         }
                     }
 
