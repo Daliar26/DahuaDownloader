@@ -23,6 +23,19 @@ object P2pBridge {
         }
     }
 
+    fun isRunning(): Boolean = invokeStringOrBoolean("isRunning") as? Boolean ?: false
+
+    fun health(): String = invokeStringOrBoolean("health") as? String ?: "P2P health API недоступен"
+
+    fun diagnostics(): String = invokeStringOrBoolean("diagnostics") as? String ?: ""
+
+    private fun invokeStringOrBoolean(name: String): Any? = runCatching {
+        val type = Class.forName(CLASS_NAME)
+        type.methods.firstOrNull {
+            it.name.equals(name, ignoreCase = true) && it.parameterTypes.isEmpty()
+        }?.invoke(null)
+    }.getOrNull()
+
     fun stop() {
         runCatching {
             val type = Class.forName(CLASS_NAME)
