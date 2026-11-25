@@ -3,7 +3,7 @@ name: Build Dahua Downloader APK
 on:
   push:
     branches:
-      - main
+      - '**'
   pull_request:
     branches:
       - main
@@ -69,6 +69,15 @@ jobs:
           go get -tool golang.org/x/mobile/cmd/gobind
           go mod tidy
           gomobile bind -v -target=android/arm64 -androidapi 26 -javapkg=ru.dahuatools.p2p -o ../app/libs/dahua-p2p.aar .
+
+      - name: Verify generated P2P Java binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app/libs/dahua-p2p.aar
+          unzip -p app/libs/dahua-p2p.aar classes.jar > /tmp/p2p-classes.jar
+          jar tf /tmp/p2p-classes.jar | grep -Fx 'ru/dahuatools/p2p/p2pbridge/P2pbridge.class'
+          echo "P2P Java binding is packaged"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
