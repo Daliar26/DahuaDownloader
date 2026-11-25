@@ -5,6 +5,7 @@ import com.company.NetSDK.CB_fHaveReConnect
 import com.company.NetSDK.CB_fSearchDevicesCB
 import com.company.NetSDK.EM_LOGIN_SPAC_CAP_TYPE
 import com.company.NetSDK.EM_QUERY_RECORD_TYPE
+import com.company.NetSDK.EM_USEDEV_MODE
 import com.company.NetSDK.INetSDK
 import com.company.NetSDK.NET_IN_DOWNLOAD_PIECE_FILE
 import com.company.NetSDK.NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY
@@ -272,9 +273,19 @@ object NetSdk {
         target.parentFile?.mkdirs()
         target.delete() // DownloadByTimeEx не поддерживает продолжение по байтовому смещению.
         val api = INetSDK::class.java
+        // Android NetSDK Java demo uses the 9-argument DownloadByTimeEx overload.
         val download = api.methods.firstOrNull {
-            it.name == "DownloadByTimeEx" && it.parameterTypes.size == 11
-        } ?: throw SdkException("В установленном INetSDK отсутствует DownloadByTimeEx с ожидаемой сигнатурой")
+            it.name == "DownloadByTimeEx" && it.parameterTypes.size == 9
+        } ?: throw SdkException(
+            "INetSDK не содержит DownloadByTimeEx(9 параметров). Найдены методы: " +
+                api.methods.filter { it.name.contains("DownloadByTime", ignoreCase = true) }
+                    .joinToString { m -> m.name + "(" + m.parameterTypes.joinToString { it.simpleName } + ")" }
+                    .ifBlank { "нет методов DownloadByTime" }
+        )
+
+        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
+            throw SdkException("Не удалось установить основной поток записи (SDK ${lastError()})")
+        }
 
         val callbackType = download.parameterTypes[6]
         if (!callbackType.isInterface) {
@@ -283,6 +294,7 @@ object NetSdk {
         val finished = java.util.concurrent.CountDownLatch(1)
         val totalRef = java.util.concurrent.atomic.AtomicLong(-1L)
         val doneRef = java.util.concurrent.atomic.AtomicLong(0L)
+        val callbackError = java.util.concurrent.atomic.AtomicBoolean(false)
         val callback = java.lang.reflect.Proxy.newProxyInstance(
             callbackType.classLoader, arrayOf(callbackType)
         ) { proxy, called, args ->
@@ -292,32 +304,39 @@ object NetSdk {
                 "equals" -> proxy === args?.getOrNull(0)
                 else -> {
                     val values = args ?: emptyArray()
-                    // Dahua callback: handle, total bytes, downloaded bytes, index, file info, user.
+                    // Android Java callback: handle,total,downloaded,index,recordInfo.
                     if (values.size >= 3) {
-                        val total = (values[1] as? Number)?.toLong()?.and(0xFFFFFFFFL) ?: -1L
-                        val done = (values[2] as? Number)?.toLong()?.and(0xFFFFFFFFL) ?: 0L
-                        if (total >= 0) totalRef.set(total)
-                        doneRef.set(done)
-                        onProgress(done, totalRef.get())
-                        if (total > 0 && done >= total) finished.countDown()
+                        val totalRaw = (values[1] as? Number)?.toLong() ?: -1L
+                        val doneRaw = (values[2] as? Number)?.toLong() ?: 0L
+                        if (doneRaw == -2L) {
+                            callbackError.set(true) // Dahua: failed / permission denied.
+                            finished.countDown()
+                        } else if (doneRaw == -1L) {
+                            finished.countDown() // Dahua: completed sentinel.
+                        } else {
+                            val total = totalRaw and 0xFFFFFFFFL
+                            val done = doneRaw and 0xFFFFFFFFL
+                            if (total > 0) totalRef.set(total)
+                            doneRef.set(done)
+                            onProgress(done, totalRef.get())
+                            if (total > 0 && done >= total) finished.countDown()
+                        }
                     }
                     null
                 }
             }
         }
 
-        val args = arrayOfNulls<Any>(11)
+        val args = arrayOfNulls<Any>(9)
         args[0] = login
         args[1] = channel0
-        args[2] = 0 // EM_RECORD_TYPE_ALL
+        args[2] = EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL
         args[3] = netTime(from)
         args[4] = netTime(to)
         args[5] = target.absolutePath
         args[6] = callback
-        args[7] = 0L
+        args[7] = null
         args[8] = null
-        args[9] = 0L
-        args[10] = null
 
         val handle = try {
             (download.invoke(null, *args) as? Number)?.toLong() ?: 0L
@@ -345,6 +364,9 @@ object NetSdk {
                 if (System.currentTimeMillis() - startedAt > 4 * 60 * 60 * 1000L) {
                     throw SdkException("Превышено время загрузки интервала")
                 }
+            }
+            if (callbackError.get()) {
+                throw SdkException("Регистратор отклонил выгрузку интервала (SDK ${lastError()})")
             }
             if (!target.exists() || target.length() == 0L) {
                 throw SdkException("Регистратор завершил выгрузку, но файл пустой (SDK ${lastError()})")
