@@ -17,6 +17,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -55,6 +57,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var p2pSerial by mutableStateOf(prefs.getString("p2p_serial", "") ?: "")
     private var p2pStarted = false
+    private var p2pPassword = ""
+    private val p2pReconnectMutex = Mutex()
     var connected by mutableStateOf(false)
         private set
     var busy by mutableStateOf(false)
@@ -86,7 +90,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val jobs = mutableStateListOf<DownloadJob>()
     val log = mutableStateListOf<String>()
 
-    private var loginHandle = 0L
+    @Volatile private var loginHandle = 0L
     private val running = HashMap<String, Job>()
     private var semaphore = Semaphore(parallel)
 
@@ -256,6 +260,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val serial = p2pSerial.trim()
         val login = user.trim()
         val pass = password
+        if (useP2p) p2pPassword = pass
         busy = true
         status = if (useP2p) "Подключение через Dahua P2P…" else "Подключение…"
         viewModelScope.launch {
@@ -292,14 +297,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 tab = 1
             } catch (e: CancellationException) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
+                p2pPassword = ""
                 throw e
             } catch (e: SdkException) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
+                p2pPassword = ""
                 status = e.message ?: "Ошибка"
                 DiagnosticLog.write("ERROR", "CONNECT", "SdkException: ${e.message}")
                 addLog("Ошибка подключения: ${e.message}")
             } catch (e: Throwable) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
+                p2pPassword = ""
                 status = "Сбой: ${e.javaClass.simpleName}: ${e.message}"
                 DiagnosticLog.write("ERROR", "CONNECT", "Необработанное исключение ${e.javaClass.name}: ${e.message}")
                 addLog(status)
@@ -324,6 +332,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         P2pBridge.stop()
                         p2pStarted = false
                     }
+                    p2pPassword = ""
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -365,6 +374,49 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+
+    /**
+     * Проверяет P2P перед каждой архивной операцией. Если библиотека уже закрыла
+     * туннель, создаёт новый и обязательно выполняет новый NetSDK login:
+     * старый loginHandle привязан к прежнему TCP-соединению.
+     */
+    private suspend fun ensureP2pSession() {
+        if (!p2pEnabled) return
+        p2pReconnectMutex.withLock {
+            val health = P2pBridge.health()
+            DiagnosticLog.write("INFO", "P2P/HEALTH", health)
+            if (P2pBridge.isRunning()) return@withLock
+            if (p2pPassword.isBlank()) {
+                throw SdkException("P2P-туннель потерян. Нужен повторный вход: пароль не хранится на диске.")
+            }
+            addLog("P2P: туннель потерян; выполняю переподключение и новый вход NetSDK")
+            DiagnosticLog.write("ERROR", "P2P/RECOVERY", "Туннель закрыт; начинаю однократное восстановление")
+            val oldHandle = loginHandle
+            if (oldHandle != 0L) runCatching { NetSdk.logout(oldHandle) }
+            P2pBridge.stop()
+            val startError = P2pBridge.start(p2pSerial.trim(), user.trim(), p2pPassword, 37778, 37777)
+            if (startError.isNotBlank()) {
+                throw SdkException("Не удалось восстановить P2P: $startError")
+            }
+            p2pStarted = true
+            try {
+                val info = NetSdk.login("127.0.0.1", 37778, user.trim(), p2pPassword)
+                loginHandle = info.handle
+                connected = true
+                status = "Подключено (P2P восстановлен)"
+                deviceInfo = "Каналов: ${info.channels}, SN: ${info.serial}, соединение: Dahua P2P"
+                addLog("P2P восстановлен; NetSDK login выполнен заново")
+                DiagnosticLog.write("INFO", "P2P/RECOVERY", "Новый login успешен; handle=${info.handle}")
+            } catch (e: Throwable) {
+                P2pBridge.stop()
+                p2pStarted = false
+                connected = false
+                loginHandle = 0L
+                throw e
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ поиск архива
 
     fun search() {
@@ -381,6 +433,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 addLog("Поиск архива: канал=${q.channel0 + 1}, с=${q.from}, по=${q.to}")
                 val res = withContext(Dispatchers.IO) {
+                    ensureP2pSession()
                     NetSdk.findRecordings(
                         loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
                     )
@@ -572,6 +625,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else if (byTime) " (единый файл за интервал)" else ""
                     )
                     withContext(Dispatchers.IO) {
+                        ensureP2pSession()
                         if (byTime) {
                             NetSdk.downloadByTime(
                                 loginHandle, job.camera - 1,
