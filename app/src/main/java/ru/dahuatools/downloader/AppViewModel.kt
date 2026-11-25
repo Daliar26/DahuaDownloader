@@ -345,7 +345,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun onConnectionRestored() {
         viewModelScope.launch(Dispatchers.Main.immediate) {
             val candidates = jobs.filter {
-                it.status == JobStatus.ERROR && it.retryCount < MAX_AUTO_RETRIES && !running.containsKey(it.id)
+                it.status == JobStatus.ERROR && it.deviceFile != "__DOWNLOAD_BY_TIME__" &&
+                    it.retryCount < MAX_AUTO_RETRIES && !running.containsKey(it.id)
             }
             if (candidates.isEmpty()) return@launch
             addLog("Связь восстановлена — продолжаю ${candidates.size} загрузку(и) с места обрыва")
@@ -434,6 +435,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (existing != null) {
             if (existing.active) {
                 message = "Этот интервал уже в загрузках"
+                return
+            }
+            if (existing.deviceFile == marker && existing.status == JobStatus.ERROR) {
+                message = "Этот интервал уже завершился ошибкой. Изучите журнал; повторный запуск — вручную кнопкой «Повторить»."
+                addLog("Автоповтор единого интервала заблокирован после предыдущей ошибки")
                 return
             }
             retryJob(existing.id)
