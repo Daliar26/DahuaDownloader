@@ -29,6 +29,8 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** Сколько раз пробовать докачать файл автоматически после восстановления связи. */
 private const val MAX_AUTO_RETRIES = 3
@@ -629,6 +631,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         (if (resuming) "Продолжение: " else "Старт: ") + job.title +
                             if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else if (byTime) " (единый файл за интервал)" else ""
                     )
+                    val progressLastAt = AtomicLong(0L)
+                    val progressLastPct = AtomicInteger(-1)
                     withContext(Dispatchers.IO) {
                         ensureP2pSession()
                         if (byTime) {
@@ -637,16 +641,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                 NetSdk.parseDateTime(job.from), NetSdk.parseDateTime(job.to), tmpDav
                             ) { done, total ->
                                 val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
-                                viewModelScope.launch(Dispatchers.Main.immediate) {
-                                    update(id) { it.copy(progress = pct) }
-                                }
+                                publishProgress(id, pct, progressLastAt, progressLastPct)
                             }
                         } else {
                             NetSdk.downloadFilePiece(loginHandle, job.deviceFile, tmpDav) { done, total ->
                                 val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
-                                viewModelScope.launch(Dispatchers.Main.immediate) {
-                                    update(id) { it.copy(progress = pct) }
-                                }
+                                publishProgress(id, pct, progressLastAt, progressLastPct)
                             }
                         }
                     }
@@ -714,11 +714,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------------ вспомогательное
 
-    private fun update(id: String, f: (DownloadJob) -> DownloadJob) {
+    // Ограничиваем обновление интерфейса двумя событиями в секунду.
+    // Частые callback SDK не должны запускать сотни Compose recomposition и JSON-записей.
+    private fun publishProgress(id: String, pct: Int, lastAt: AtomicLong, lastPct: AtomicInteger) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val previous = lastPct.get()
+        if (pct == previous) return
+        if (pct != 100 && now - lastAt.get() < 500L) return
+        if (!lastPct.compareAndSet(previous, pct)) return
+        lastAt.set(now)
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            update(id, persist = false) { it.copy(progress = pct) }
+        }
+    }
+
+    private fun update(id: String, persist: Boolean = true, f: (DownloadJob) -> DownloadJob) {
         val i = jobs.indexOfFirst { it.id == id }
         if (i >= 0) {
             jobs[i] = f(jobs[i])
-            persistJobs()
+            if (persist) persistJobs()
         }
     }
 
