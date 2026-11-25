@@ -6,7 +6,7 @@ package ru.dahuatools.downloader
  * before Gradle compilation.
  */
 object P2pBridge {
-    private const val CLASS_NAME = "ru.dahuatools.p2p.P2pbridge"
+    private const val CLASS_NAME = "ru.dahuatools.p2p.p2pbridge.P2pbridge"
 
     fun start(serial: String, username: String, password: String, localPort: Int, devicePort: Int): String {
         return try {
@@ -16,7 +16,7 @@ object P2pBridge {
             } ?: return "В P2P-библиотеке не найден метод запуска"
             method.invoke(null, serial, username, password, localPort, devicePort) as? String ?: ""
         } catch (e: ClassNotFoundException) {
-            "P2P-библиотека не собрана. Обновите приложение до последней сборки."
+            "Класс P2P-моста не найден в APK: $CLASS_NAME. Проверьте состав сборки."
         } catch (e: Throwable) {
             val cause = e.cause ?: e
             "Ошибка запуска P2P: ${cause.message ?: cause.javaClass.simpleName}"
