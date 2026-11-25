@@ -507,6 +507,12 @@ private fun DownloadsTab(vm: AppViewModel) {
                     }
                 }
                 if (vm.showLog) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { vm.addLog("Пользователь запросил экспорт журнала"); vm.exportDiagnosticLog() }) {
+                            Text("Сохранить подробный лог")
+                        }
+                        OutlinedButton(onClick = { vm.showLog = false }) { Text("Скрыть") }
+                    }
                     SelectionContainer {
                         Text(
                             if (vm.log.isEmpty()) "Пока пусто" else vm.log.take(40).joinToString("\n"),
