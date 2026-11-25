@@ -402,16 +402,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val info = NetSdk.login("127.0.0.1", 37778, user.trim(), p2pPassword)
                 loginHandle = info.handle
-                connected = true
-                status = "Подключено (P2P восстановлен)"
-                deviceInfo = "Каналов: ${info.channels}, SN: ${info.serial}, соединение: Dahua P2P"
+                withContext(Dispatchers.Main.immediate) {
+                    connected = true
+                    status = "Подключено (P2P восстановлен)"
+                    deviceInfo = "Каналов: ${info.channels}, SN: ${info.serial}, соединение: Dahua P2P"
+                }
                 addLog("P2P восстановлен; NetSDK login выполнен заново")
                 DiagnosticLog.write("INFO", "P2P/RECOVERY", "Новый login успешен; handle=${info.handle}")
             } catch (e: Throwable) {
                 P2pBridge.stop()
                 p2pStarted = false
-                connected = false
                 loginHandle = 0L
+                withContext(Dispatchers.Main.immediate) {
+                    connected = false
+                    status = "P2P потерян — подключитесь заново"
+                }
                 throw e
             }
         }
