@@ -311,7 +311,7 @@ object NetSdk {
         target.parentFile?.mkdirs()
         target.delete() // DownloadByTimeEx не поддерживает продолжение по байтовому смещению.
         val api = INetSDK::class.java
-        // Android NetSDK Java demo uses the 9-argument DownloadByTimeEx overload.
+        // Prefer the documented 11-argument Java overload; retain 9-argument compatibility for older SDK JARs.
         val overloads = api.methods.filter { it.name == "DownloadByTimeEx" }
         overloads.forEach { trace("API", methodInfo(it)) }
         val download = api.methods
@@ -405,7 +405,7 @@ object NetSdk {
         trace("BYTIME", "Аргументы сформированы по типам параметров; callbackIndex=6")
 
         val handle = try {
-            trace("BYTIME", "Вызов DownloadByTimeEx с 9 аргументами; callbackIndex=6")
+            trace("BYTIME", "Вызов DownloadByTimeEx; число аргументов=${args.size}; callbackIndex=6")
             (download.invoke(null, *args) as? Number)?.toLong() ?: 0L
         } catch (e: Throwable) {
             val code = lastError()
