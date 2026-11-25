@@ -5,6 +5,7 @@ import com.company.NetSDK.CB_fHaveReConnect
 import com.company.NetSDK.CB_fSearchDevicesCB
 import com.company.NetSDK.EM_LOGIN_SPAC_CAP_TYPE
 import com.company.NetSDK.EM_QUERY_RECORD_TYPE
+import com.company.NetSDK.EM_USEDEV_MODE
 import com.company.NetSDK.INetSDK
 import com.company.NetSDK.NET_IN_DOWNLOAD_PIECE_FILE
 import com.company.NetSDK.NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY
@@ -155,10 +156,20 @@ object NetSdk {
         to: NET_TIME,
         limit: Int
     ): SearchResult {
+        // Dahua requires the recording stream type to be selected before archive
+        // queries on some NVR firmware. Use the same mode as DownloadByTimeEx.
+        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
+            val error = lastError()
+            throw SdkException("SetDeviceMode перед FindFile завершился ошибкой SDK $error")
+        }
+
         val h = INetSDK.FindFile(
             login, channel0, EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL, null, from, to, false, 10000
         )
-        if (h == 0L) throw SdkException("FindFile: ошибка SDK ${lastError()}")
+        if (h == 0L) {
+            val error = lastError() // capture immediately; later SDK calls overwrite it
+            throw SdkException("FindFile вернул пустой handle (SDK $error)")
+        }
         val items = ArrayList<RecordItem>()
         var truncated = false
         try {
@@ -254,6 +265,131 @@ object NetSdk {
 
         if (!target.exists() || target.length() == 0L) {
             throw SdkException("Файл не создан или пустой (в этом периоде может не быть записи)")
+        }
+    }
+
+    /**
+     * Скачивает весь выбранный интервал одним файлом через Dahua DownloadByTimeEx.
+     * SDK выполняет передачу асинхронно; callback удерживается до StopDownload.
+     */
+    suspend fun downloadByTime(
+        login: Long,
+        channel0: Int,
+        from: LocalDateTime,
+        to: LocalDateTime,
+        target: File,
+        onProgress: (done: Long, total: Long) -> Unit
+    ) {
+        target.parentFile?.mkdirs()
+        target.delete() // DownloadByTimeEx не поддерживает продолжение по байтовому смещению.
+        val api = INetSDK::class.java
+        // Android NetSDK Java demo uses the 9-argument DownloadByTimeEx overload.
+        val download = api.methods.firstOrNull {
+            it.name == "DownloadByTimeEx" && it.parameterTypes.size == 9
+        } ?: throw SdkException(
+            "INetSDK не содержит DownloadByTimeEx(9 параметров). Найдены методы: " +
+                api.methods.filter { it.name.contains("DownloadByTime", ignoreCase = true) }
+                    .joinToString { m -> m.name + "(" + m.parameterTypes.joinToString { it.simpleName } + ")" }
+                    .ifBlank { "нет методов DownloadByTime" }
+        )
+
+        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
+            throw SdkException("Не удалось установить основной поток записи (SDK ${lastError()})")
+        }
+
+        val callbackType = download.parameterTypes[6]
+        if (!callbackType.isInterface) {
+            throw SdkException("Неизвестный тип callback DownloadByTimeEx: ${callbackType.name}")
+        }
+        val finished = java.util.concurrent.CountDownLatch(1)
+        val totalRef = java.util.concurrent.atomic.AtomicLong(-1L)
+        val doneRef = java.util.concurrent.atomic.AtomicLong(0L)
+        val callbackError = java.util.concurrent.atomic.AtomicBoolean(false)
+        val callback = java.lang.reflect.Proxy.newProxyInstance(
+            callbackType.classLoader, arrayOf(callbackType)
+        ) { proxy, called, args ->
+            when (called.name) {
+                "toString" -> "DahuaTimeDownloadCallback"
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals" -> proxy === args?.getOrNull(0)
+                else -> {
+                    val values = args ?: emptyArray()
+                    // Android Java callback: handle,total,downloaded,index,recordInfo.
+                    if (values.size >= 3) {
+                        val totalRaw = (values[1] as? Number)?.toLong() ?: -1L
+                        val doneRaw = (values[2] as? Number)?.toLong() ?: 0L
+                        if (doneRaw == -2L) {
+                            callbackError.set(true) // Dahua: failed / permission denied.
+                            finished.countDown()
+                        } else if (doneRaw == -1L) {
+                            finished.countDown() // Dahua: completed sentinel.
+                        } else {
+                            val total = totalRaw and 0xFFFFFFFFL
+                            val done = doneRaw and 0xFFFFFFFFL
+                            if (total > 0) totalRef.set(total)
+                            doneRef.set(done)
+                            onProgress(done, totalRef.get())
+                            if (total > 0 && done >= total) finished.countDown()
+                        }
+                    }
+                    null
+                }
+            }
+        }
+
+        val args = arrayOfNulls<Any>(9)
+        args[0] = login
+        args[1] = channel0
+        args[2] = EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL
+        args[3] = netTime(from)
+        args[4] = netTime(to)
+        args[5] = target.absolutePath
+        args[6] = callback
+        args[7] = null
+        args[8] = null
+
+        val handle = try {
+            (download.invoke(null, *args) as? Number)?.toLong() ?: 0L
+        } catch (e: Throwable) {
+            throw SdkException("DownloadByTimeEx: ${e.cause?.message ?: e.message}; SDK ${lastError()}")
+        }
+        if (handle == 0L) {
+            throw SdkException("DownloadByTimeEx не запустился (SDK ${lastError()})")
+        }
+
+        val startedAt = System.currentTimeMillis()
+        var lastBytes = -1L
+        var lastChangeAt = startedAt
+        try {
+            while (!finished.await(250, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                currentCoroutineContext().ensureActive()
+                val done = doneRef.get()
+                if (done != lastBytes) {
+                    lastBytes = done
+                    lastChangeAt = System.currentTimeMillis()
+                }
+                if (System.currentTimeMillis() - lastChangeAt > 120_000L) {
+                    throw SdkException("Нет данных от регистратора более 2 минут (SDK ${lastError()})")
+                }
+                if (System.currentTimeMillis() - startedAt > 4 * 60 * 60 * 1000L) {
+                    throw SdkException("Превышено время загрузки интервала")
+                }
+            }
+            if (callbackError.get()) {
+                throw SdkException("Регистратор отклонил выгрузку интервала (SDK ${lastError()})")
+            }
+            if (!target.exists() || target.length() == 0L) {
+                throw SdkException("Регистратор завершил выгрузку, но файл пустой (SDK ${lastError()})")
+            }
+            onProgress(target.length(), target.length())
+        } finally {
+            try {
+                val stop = api.methods.firstOrNull {
+                    it.name == "StopDownload" && it.parameterTypes.size == 1
+                }
+                stop?.invoke(null, handle)
+            } catch (_: Throwable) {
+            }
         }
     }
 

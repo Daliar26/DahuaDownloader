@@ -275,9 +275,19 @@ private fun ConnectionTab(vm: AppViewModel) {
         item {
             AppCard {
                 Text("Регистратор", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Field(vm.ip, { vm.ip = it }, "Адрес: IP или доменное имя", enabled = !vm.connected)
-                Field(vm.port, { vm.port = it }, "Порт (по умолчанию 37777)",
-                    keyboard = KeyboardType.Number, enabled = !vm.connected)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Подключение через Dahua P2P (тест)", modifier = Modifier.weight(1f))
+                    Switch(checked = vm.p2pEnabled, onCheckedChange = { vm.setP2pMode(it) },
+                        enabled = !vm.connected && !vm.busy)
+                }
+                if (vm.p2pEnabled) {
+                    Field(vm.p2pSerial, { vm.p2pSerial = it }, "Серийный номер (SN)", enabled = !vm.connected)
+                    Hint("P2P использует серийный номер и учётные данные регистратора. Совместимость порта 37777 зависит от модели и прошивки.")
+                } else {
+                    Field(vm.ip, { vm.ip = it }, "Адрес: IP или доменное имя", enabled = !vm.connected)
+                    Field(vm.port, { vm.port = it }, "Порт (по умолчанию 37777)",
+                        keyboard = KeyboardType.Number, enabled = !vm.connected)
+                }
                 Field(vm.user, { vm.user = it }, "Логин", enabled = !vm.connected)
                 Field(vm.password, { vm.password = it }, "Пароль", password = true, enabled = !vm.connected)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -317,20 +327,16 @@ private fun ConnectionTab(vm: AppViewModel) {
             AppCard {
                 Text("Доступ из интернета", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Text(
-                    "Автоматический P2P по серийному номеру в этой сборке недоступен: " +
-                        "для него SDK требует параметры P2P-сервера Dahua, которых в проекте нет.",
+                    "Для удалённого доступа используйте P2P-режим выше, если он поддерживается регистратором. " +
+                        "Если P2P не подключается, безопасный резервный вариант — VPN до домашней сети.",
                     style = MaterialTheme.typography.bodyMedium
                 )
-                Hint(
-                    "Что работает уже сейчас:\n" +
-                        "1) VPN до домашней сети (WireGuard или Tailscale на роутере), затем вход по локальному IP.\n" +
-                        "2) DDNS на регистраторе и проброс порта 37777 на роутере, затем вход по доменному имени " +
-                        "в поле «Адрес». Открытый порт в интернет рискован: нужен сложный пароль."
-                )
+                Hint("Не открывайте порт регистратора напрямую в интернет. Используйте VPN, " +
+                    "а затем подключайтесь по локальному IP регистратора.")
             }
         }
 
-        item { Hint("Версия 0.3.0") }
+        item { Hint("Версия 0.4.0") }
     }
 }
 
@@ -360,6 +366,11 @@ private fun ArchiveTab(vm: AppViewModel) {
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("Найти") }
                 Hint(vm.message)
+                Button(
+                    onClick = { vm.downloadInterval() },
+                    enabled = vm.connected && !vm.busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Скачать весь интервал одним файлом") }
             }
         }
 
@@ -389,10 +400,7 @@ private fun ArchiveTab(vm: AppViewModel) {
                                 )
                                 Hint(String.format("%s · %.1f МБ", r.start.substringBefore(' '), r.sizeKb / 1024.0))
                             }
-                            Button(
-                                onClick = { vm.downloadFile(r) },
-                                enabled = vm.connected && !queued
-                            ) { Text(if (queued) "✓ В загрузках" else "⬇ Скачать") }
+                            Text(if (queued) "✓ В загрузках" else "Фрагмент")
                         }
                     }
                 }
