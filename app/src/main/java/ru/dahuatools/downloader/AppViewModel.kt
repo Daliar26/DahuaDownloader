@@ -55,9 +55,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var p2pSerial by mutableStateOf(prefs.getString("p2p_serial", "") ?: "")
     private var p2pStarted = false
-    private var p2pModeActive = false
-    private var p2pRtspUser = ""
-    private var p2pRtspPassword = ""
     var connected by mutableStateOf(false)
         private set
     var busy by mutableStateOf(false)
@@ -260,23 +257,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val info = withContext(Dispatchers.IO) {
                     if (useP2p) {
-                        // The open-source P2P transport exposes RTSP, not the proprietary
-                        // DVRIP/NetSDK service on port 37777. Dial the recorder RTSP port.
-                        val p2pError = P2pBridge.start(serial, login, pass, 37778, 0)
+                        val p2pError = P2pBridge.start(serial, login, pass, 37778, 37777)
                         if (p2pError.isNotBlank()) throw SdkException(p2pError)
                         p2pStarted = true
-                        addLog("P2P-туннель открыт для RTSP playback")
-                        LoginInfo(0L, 4, serial, -1, null)
-                    } else {
-                        NetSdk.onEvent = { addLog(it) }
-                        NetSdk.onReconnect = { onConnectionRestored() }
-                        NetSdk.ensureInit { addLog(it) }
-                        NetSdk.login(host, connectPort, login, pass)
+                        addLog("P2P-туннель установлен; проверяю соединение NetSDK")
                     }
+                    NetSdk.onEvent = { addLog(it) }
+                    NetSdk.onReconnect = { onConnectionRestored() }
+                    NetSdk.ensureInit { addLog(it) }
+                    NetSdk.login(host, connectPort, login, pass)
                 }
                 loginHandle = info.handle
-                p2pModeActive = useP2p
-                if (useP2p) { p2pRtspUser = login; p2pRtspPassword = pass }
                 connected = true
                 status = "Подключено"
                 deviceInfo = "Каналов: ${info.channels}, SN: ${info.serial}" +
@@ -318,7 +309,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 withContext(Dispatchers.IO) {
                     toStop.joinAll()
-                    if (h != 0L) NetSdk.logout(h)
+                    NetSdk.logout(h)
                     if (p2pStarted) {
                         P2pBridge.stop()
                         p2pStarted = false
@@ -330,9 +321,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 addLog("Выход: ${e.message}")
             } finally {
                 loginHandle = 0L
-                p2pModeActive = false
-                p2pRtspUser = ""
-                p2pRtspPassword = ""
                 connected = false
                 status = "Отключено"
                 deviceInfo = ""
@@ -374,10 +362,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         if (busy) return
-        if (p2pModeActive) {
-            message = "P2P использует RTSP playback: список файлов NetSDK недоступен. Выгрузите нужный интервал одной записью."
-            return
-        }
         val q = buildQuery() ?: return
         busy = true
         message = "Поиск записей…"
@@ -550,14 +534,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else if (byTime) " (единый файл за интервал)" else ""
                     )
                     withContext(Dispatchers.IO) {
-                        if (byTime && p2pModeActive) {
-                            update(id) { it.copy(message = "Получаю единый RTSP-поток за выбранный интервал…") }
-                            val error = RtspPlayback.download(
-                                p2pRtspUser, p2pRtspPassword, job.camera,
-                                NetSdk.parseDateTime(job.from), NetSdk.parseDateTime(job.to), tempMp4File(id)
-                            )
-                            if (error != null) throw SdkException(error)
-                        } else if (byTime) {
+                        if (byTime) {
                             NetSdk.downloadByTime(
                                 loginHandle, job.camera - 1,
                                 NetSdk.parseDateTime(job.from), NetSdk.parseDateTime(job.to), tmpDav
@@ -577,11 +554,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     }
 
-                    var exportFile = if (byTime && p2pModeActive) tempMp4File(id) else tmpDav
-                    var ext = if (byTime && p2pModeActive) "mp4" else "dav"
-                    var mime = if (byTime && p2pModeActive) "video/mp4" else "application/octet-stream"
+                    var exportFile = tmpDav
+                    var ext = "dav"
+                    var mime = "application/octet-stream"
                     var note = ""
-                    if (!p2pModeActive && convertMp4 && Mp4Converter.available()) {
+                    if (convertMp4 && Mp4Converter.available()) {
                         update(id) {
                             it.copy(status = JobStatus.CONVERTING, progress = 100, message = "Конвертация в MP4…")
                         }
@@ -595,7 +572,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             note = "\nMP4 не получился, сохранён исходный DAV"
                             addLog("Конвертация: $err")
                         }
-                    } else if (!p2pModeActive && convertMp4) {
+                    } else if (convertMp4) {
                         note = "\nFFmpeg нет в этой сборке, сохранён исходный DAV"
                     }
 
