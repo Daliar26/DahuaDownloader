@@ -365,7 +365,7 @@ object NetSdk {
             }
         }
 
-        val args = arrayOfNulls<Any>(9)
+        val args = arrayOfNulls<Any>(download.parameterTypes.size)
         args[0] = login
         args[1] = channel0
         args[2] = EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL
@@ -373,8 +373,22 @@ object NetSdk {
         args[4] = netTime(to)
         args[5] = target.absolutePath
         args[6] = callback
-        args[7] = null
-        args[8] = null
+        for (index in 7 until args.size) {
+            val type = download.parameterTypes[index]
+            args[index] = when {
+                !type.isPrimitive -> null
+                type == java.lang.Long.TYPE -> 0L
+                type == java.lang.Integer.TYPE -> 0
+                type == java.lang.Boolean.TYPE -> false
+                type == java.lang.Float.TYPE -> 0f
+                type == java.lang.Double.TYPE -> 0.0
+                type == java.lang.Short.TYPE -> 0.toShort()
+                type == java.lang.Byte.TYPE -> 0.toByte()
+                type == java.lang.Character.TYPE -> 0.toChar()
+                else -> null
+            }
+        }
+        trace("BYTIME", "Аргументы сформированы по типам параметров; callbackIndex=6")
 
         val handle = try {
             trace("BYTIME", "Вызов DownloadByTimeEx с 9 аргументами; callbackIndex=6")
