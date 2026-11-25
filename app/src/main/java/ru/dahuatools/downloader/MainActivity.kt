@@ -336,7 +336,7 @@ private fun ConnectionTab(vm: AppViewModel) {
             }
         }
 
-        item { Hint("Версия 0.3.0") }
+        item { Hint("Версия 0.4.0") }
     }
 }
 
@@ -366,13 +366,11 @@ private fun ArchiveTab(vm: AppViewModel) {
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("Найти") }
                 Hint(vm.message)
-                if (vm.found.isNotEmpty()) {
-                    Button(
-                        onClick = { vm.downloadInterval() },
-                        enabled = vm.connected,
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("Скачать весь интервал одним файлом") }
-                }
+                Button(
+                    onClick = { vm.downloadInterval() },
+                    enabled = vm.connected && !vm.busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Скачать весь интервал одним файлом") }
             }
         }
 
