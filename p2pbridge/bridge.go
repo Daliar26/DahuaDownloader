@@ -100,13 +100,38 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 		remember(fmt.Sprintf(format, values...))
 	}
 	recordDiagnostic("INFO", serial, username, password, "Запуск P2P handshake; timeout=20s; maxRealms=4")
-	client, err := dahua.ConnectWithConfig(dahua.Config{
+	cfg := dahua.Config{
 		Serial: serial, Username: username, Password: password,
 		Timeout: 20 * time.Second, MaxRealms: 4,
 		Trace: trace, Error: reportError,
-	})
+	}
+	var client *dahua.Client
+	var err error
+	for attempt := 1; attempt <= 2; attempt++ {
+		recordDiagnostic("INFO", serial, username, password, "P2P handshake: попытка %d/2", attempt)
+		client, err = dahua.ConnectWithConfig(cfg)
+		if err == nil {
+			break
+		}
+		errText := strings.ToLower(err.Error())
+		if strings.Contains(errText, "operation not permitted") || strings.Contains(errText, "permission denied") {
+			recordDiagnostic("ERROR", serial, username, password, "UDP запрещён системой или сетевым фильтром; повтор handshake остановлен: %v", err)
+			return remember("P2P: Android/сеть запрещает исходящий UDP. Проверьте VPN, сетевой фильтр или другую сеть.")
+		}
+		var netErr net.Error
+		if attempt == 1 && errors.As(err, &netErr) && netErr.Timeout() {
+			recordDiagnostic("WARN", serial, username, password, "UDP handshake timeout; повтор через 2 секунды: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		break
+	}
 	if err != nil {
 		recordDiagnostic("ERROR", serial, username, password, "Handshake завершился ошибкой: %v", err)
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return remember(fmt.Sprintf("P2P: тайм-аут UDP-ответа облачного сервера Dahua: %v. Возможна блокировка UDP текущей сетью.", err))
+		}
 		return remember(fmt.Sprintf("P2P: %v", err))
 	}
 
