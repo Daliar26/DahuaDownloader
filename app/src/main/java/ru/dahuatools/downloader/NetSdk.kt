@@ -346,6 +346,7 @@ object NetSdk {
         val totalRef = java.util.concurrent.atomic.AtomicLong(-1L)
         val doneRef = java.util.concurrent.atomic.AtomicLong(0L)
         val callbackError = java.util.concurrent.atomic.AtomicBoolean(false)
+        val lastLoggedPercent = java.util.concurrent.atomic.AtomicInteger(-10)
         val callback = java.lang.reflect.Proxy.newProxyInstance(
             callbackType.classLoader, arrayOf(callbackType)
         ) { proxy, called, args ->
@@ -355,21 +356,28 @@ object NetSdk {
                 "equals" -> proxy === args?.getOrNull(0)
                 else -> {
                     val values = args ?: emptyArray()
-                    trace("CALLBACK", "${called.name}; argc=${values.size}; args=${values.joinToString { it?.toString()?.take(80) ?: "null" }}")
+                    // Не пишем каждый нативный callback синхронно на диск: SDK может вызывать их очень часто.
                     // Android Java callback: handle,total,downloaded,index,recordInfo.
                     if (values.size >= 3) {
                         val totalRaw = (values[1] as? Number)?.toLong() ?: -1L
                         val doneRaw = (values[2] as? Number)?.toLong() ?: 0L
                         if (doneRaw == -2L) {
                             callbackError.set(true) // Dahua: failed / permission denied.
+                            trace("CALLBACK", "DownloadByTimeEx сообщил ошибку (-2)", true)
                             finished.countDown()
                         } else if (doneRaw == -1L) {
+                            trace("CALLBACK", "DownloadByTimeEx сообщил завершение")
                             finished.countDown() // Dahua: completed sentinel.
                         } else {
                             val total = totalRaw and 0xFFFFFFFFL
                             val done = doneRaw and 0xFFFFFFFFL
                             if (total > 0) totalRef.set(total)
                             doneRef.set(done)
+                            val pct = if (totalRef.get() > 0) ((done * 100) / totalRef.get()).toInt().coerceIn(0, 100) else -1
+                            val logged = lastLoggedPercent.get()
+                            if (pct >= 0 && pct / 10 > logged / 10 && lastLoggedPercent.compareAndSet(logged, pct)) {
+                                trace("CALLBACK", "Прогресс DownloadByTimeEx: ${pct}%")
+                            }
                             onProgress(done, totalRef.get())
                             if (total > 0 && done >= total) finished.countDown()
                         }
