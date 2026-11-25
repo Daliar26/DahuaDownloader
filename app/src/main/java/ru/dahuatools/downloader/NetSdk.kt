@@ -306,21 +306,14 @@ object NetSdk {
         target.parentFile?.mkdirs()
         target.delete()
 
-        // Используем ровно тот Android API, который вызывает официальный Dahua Demo:
-        // 9 параметров и штатный CB_fTimeDownLoadPosCallBack.
-        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
-            val code = lastError()
-            trace("BYTIME", "SetDeviceMode SDK_RECORD_STREAM_TYPE=false; SDK=$code", true)
-            throw SdkException("Не удалось установить основной поток записи (SDK $code)")
-        }
-
+        // Официальный Dahua sample передаёт stream отдельно. На части NVR запись
+        // доступна не в основном потоке, поэтому пробуем main/extra/third.
         val finished = java.util.concurrent.CountDownLatch(1)
         val totalKbRef = java.util.concurrent.atomic.AtomicLong(-1L)
         val doneKbRef = java.util.concurrent.atomic.AtomicLong(0L)
         val callbackError = java.util.concurrent.atomic.AtomicBoolean(false)
         val lastLoggedPercent = java.util.concurrent.atomic.AtomicInteger(-10)
 
-        // Сильная ссылка на callback живёт до StopDownload; никаких Proxy на границе JNI.
         val callback = object : CB_fTimeDownLoadPosCallBack {
             override fun invoke(
                 lPlayHandle: Long,
@@ -351,40 +344,61 @@ object NetSdk {
                         val logged = lastLoggedPercent.get()
                         if (pct >= 0 && pct / 10 > logged / 10 &&
                             lastLoggedPercent.compareAndSet(logged, pct)
-                        ) {
-                            trace("CALLBACK", "Прогресс DownloadByTimeEx: ${pct}%")
-                        }
-                        // Dahua передаёт размеры в КБ, наружу отдаём байты.
+                        ) trace("CALLBACK", "Прогресс DownloadByTimeEx: ${pct}%")
                         onProgress(doneKb * 1024L, if (totalKbNow > 0) totalKbNow * 1024L else -1L)
                     }
                 }
             }
         }
 
-        val handle = try {
-            trace("BYTIME", "Вызов штатного DownloadByTimeEx(9 параметров)")
-            INetSDK.DownloadByTimeEx(
-                login,
-                channel0,
-                EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL,
-                netTime(from),
-                netTime(to),
-                target.absolutePath,
-                callback,
-                null,
-                null
-            )
-        } catch (e: Throwable) {
+        var selectedStream = -1
+        var handle = 0L
+        var noRecordCodes = mutableListOf<String>()
+        for (stream in 0..2) {
+            if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, stream)) {
+                val code = lastError()
+                trace("BYTIME", "SetDeviceMode stream=$stream отклонён; SDK=$code", true)
+                if (stream == 0) throw SdkException("Не удалось выбрать поток записи (SDK $code)")
+                continue
+            }
+            target.delete()
+            trace("BYTIME", "Пробую поток записи stream=$stream")
+            handle = try {
+                INetSDK.DownloadByTimeEx(
+                    login,
+                    channel0,
+                    EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL,
+                    netTime(from),
+                    netTime(to),
+                    target.absolutePath,
+                    callback,
+                    null,
+                    null
+                )
+            } catch (e: Throwable) {
+                val code = lastError()
+                trace("BYTIME", "DownloadByTimeEx stream=$stream: ${e.javaClass.simpleName}: ${e.message}; SDK=$code", true)
+                throw SdkException("DownloadByTimeEx: ${e.message}; SDK $code")
+            }
+            if (handle != 0L) {
+                selectedStream = stream
+                break
+            }
             val code = lastError()
-            trace("BYTIME", "Вызов DownloadByTimeEx завершился исключением: ${e.javaClass.name}: ${e.message}; SDK=$code", true)
-            throw SdkException("DownloadByTimeEx: ${e.message}; SDK $code")
+            trace("BYTIME", "Нет записи/запуск отклонён на stream=$stream; SDK=$code", true)
+            if (code == "0x80000018") {
+                noRecordCodes.add("stream=$stream: $code")
+                continue
+            }
+            throw SdkException("DownloadByTimeEx не запустился на потоке $stream (SDK $code)")
         }
-
         if (handle == 0L) {
-            val code = lastError()
-            trace("BYTIME", "DownloadByTimeEx вернул handle=0; SDK=$code", true)
-            throw SdkException("DownloadByTimeEx не запустился (SDK $code)")
+            throw SdkException(
+                "Регистратор не нашёл запись в выбранном канале и интервале ни в одном потоке " +
+                    "(${noRecordCodes.joinToString()}). Проверь канал и время записи."
+            )
         }
+        trace("BYTIME", "Выбран поток записи stream=$selectedStream")
 
         trace("BYTIME", "DownloadByTimeEx запущен; handle=$handle")
         val startedAt = System.currentTimeMillis()
