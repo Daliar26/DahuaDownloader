@@ -12,8 +12,8 @@ android {
         applicationId = "ru.dahuatools.downloader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 5
+        versionName = "0.5.0"
 
         // Библиотеки Dahua SDK собраны только под arm64-v8a.
         // На 32-битных устройствах и x86-эмуляторах SDK не заработает.
