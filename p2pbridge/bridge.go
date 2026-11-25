@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +29,50 @@ var (
 	stateMu   sync.Mutex
 	current   *bridge
 	lastError string
+	diagMu    sync.Mutex
+	diagLines []string
 )
+
+const maxDiagnosticLines = 300
+
+func recordDiagnostic(level, serial, username, password, format string, values ...any) {
+	message := fmt.Sprintf(format, values...)
+	for _, secret := range []string{serial, username, password} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[скрыто]")
+		}
+	}
+	line := time.Now().Format("2006-01-02 15:04:05.000") + " [" + level + "] " + message
+	diagMu.Lock()
+	diagLines = append(diagLines, line)
+	if len(diagLines) > maxDiagnosticLines {
+		diagLines = append([]string(nil), diagLines[len(diagLines)-maxDiagnosticLines:]...)
+	}
+	diagMu.Unlock()
+}
+
+func Diagnostics() string {
+	diagMu.Lock()
+	defer diagMu.Unlock()
+	return strings.Join(diagLines, "\n")
+}
+
+func Health() string {
+	stateMu.Lock()
+	b := current
+	errText := lastError
+	stateMu.Unlock()
+	if b == nil {
+		return "running=false; lastError=" + errText
+	}
+	closed := b.client.IsClosed()
+	responsive := b.client.IsResponsive(15 * time.Second)
+	retired := b.client.IsRetired()
+	realms := b.client.ActiveRealms()
+	bindFailures := b.client.BindFailures()
+	return fmt.Sprintf("running=%t; closed=%t; responsive15s=%t; retired=%t; realms=%d; bindFailures=%d; lastError=%s",
+		!closed, closed, responsive, retired, realms, bindFailures, errText)
+}
 
 // Start opens a Dahua cloud P2P tunnel and exposes the device TCP service on
 // loopback. The password is used only for the live handshake and is never
@@ -48,11 +92,21 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 		return "Некорректный порт P2P"
 	}
 
+	trace := func(format string, values ...any) {
+		recordDiagnostic("TRACE", serial, username, password, format, values...)
+	}
+	reportError := func(format string, values ...any) {
+		recordDiagnostic("ERROR", serial, username, password, format, values...)
+		remember(fmt.Sprintf(format, values...))
+	}
+	recordDiagnostic("INFO", serial, username, password, "Запуск P2P handshake; timeout=20s; maxRealms=4")
 	client, err := dahua.ConnectWithConfig(dahua.Config{
 		Serial: serial, Username: username, Password: password,
 		Timeout: 20 * time.Second, MaxRealms: 4,
+		Trace: trace, Error: reportError,
 	})
 	if err != nil {
+		recordDiagnostic("ERROR", serial, username, password, "Handshake завершился ошибкой: %v", err)
 		return remember(fmt.Sprintf("P2P: %v", err))
 	}
 
@@ -78,9 +132,11 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 	stateMu.Unlock()
 
 	client.SetOnClose(func() {
+		recordDiagnostic("ERROR", serial, username, password, "P2P tunnel OnClose: удалённая сторона закрыла туннель")
 		b.closeListener()
 		remember("P2P-туннель закрыт удалённой стороной")
 	})
+	recordDiagnostic("INFO", serial, username, password, "P2P handshake успешен; локальный TCP listener=%d -> devicePort=%d", localPort, devicePort)
 	go b.serve()
 	return ""
 }
@@ -159,6 +215,7 @@ func (b *bridge) serve() {
 }
 
 func (b *bridge) handle(local net.Conn) {
+	recordDiagnostic("INFO", "", "", "", "Принято локальное TCP-подключение от NetSDK")
 	defer local.Close()
 	b.mu.Lock()
 	b.conns[local] = struct{}{}
@@ -172,6 +229,7 @@ func (b *bridge) handle(local net.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if err := b.client.LockNegotiate(ctx); err != nil {
+		recordDiagnostic("ERROR", "", "", "", "LockNegotiate: %v", err)
 		remember(fmt.Sprintf("P2P: ожидание канала: %v", err))
 		return
 	}
@@ -180,6 +238,7 @@ func (b *bridge) handle(local net.Conn) {
 	b.client.DoneNegotiate()
 	b.client.UnlockNegotiate()
 	if err != nil {
+		recordDiagnostic("ERROR", "", "", "", "Dial devicePort=%d failed: %v; closed=%t; responsive15s=%t; bindFailures=%d", b.devicePort, err, b.client.IsClosed(), b.client.IsResponsive(15*time.Second), b.client.BindFailures())
 		remember(fmt.Sprintf("P2P: не удалось открыть TCP-порт регистратора %d: %v", b.devicePort, err))
 		return
 	}
@@ -193,10 +252,14 @@ func (b *bridge) handle(local net.Conn) {
 		b.mu.Unlock()
 	}()
 
+	recordDiagnostic("INFO", "", "", "", "Удалённый TCP realm открыт; activeRealms=%d", b.client.ActiveRealms())
 	errCh := make(chan error, 2)
 	go func() { _, e := io.Copy(remote, local); errCh <- e }()
 	go func() { _, e := io.Copy(local, remote); errCh <- e }()
-	<-errCh
+	copyErr := <-errCh
+	if copyErr != nil {
+		recordDiagnostic("WARN", "", "", "", "TCP relay завершился: %v", copyErr)
+	}
 	_ = local.Close()
 	_ = remote.Close()
 	<-errCh
