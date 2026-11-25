@@ -385,7 +385,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: SdkException) {
-                message = e.message ?: "Ошибка поиска"
+                message = if (NetSdk.lastError() == "0x80000181") {
+                    "FindFile недоступен (NET_ERROR_GET_INSTANCE). Можно попробовать скачать выбранный интервал напрямую."
+                } else e.message ?: "Ошибка поиска"
                 addLog("Ошибка поиска: ${e.message}")
             } catch (e: Throwable) {
                 message = "Сбой поиска: ${e.javaClass.simpleName}: ${e.message}"
