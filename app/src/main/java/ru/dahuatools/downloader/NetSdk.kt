@@ -156,10 +156,20 @@ object NetSdk {
         to: NET_TIME,
         limit: Int
     ): SearchResult {
+        // Dahua requires the recording stream type to be selected before archive
+        // queries on some NVR firmware. Use the same mode as DownloadByTimeEx.
+        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
+            val error = lastError()
+            throw SdkException("SetDeviceMode перед FindFile завершился ошибкой SDK $error")
+        }
+
         val h = INetSDK.FindFile(
             login, channel0, EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL, null, from, to, false, 10000
         )
-        if (h == 0L) throw SdkException("FindFile: ошибка SDK ${lastError()}")
+        if (h == 0L) {
+            val error = lastError() // capture immediately; later SDK calls overwrite it
+            throw SdkException("FindFile вернул пустой handle (SDK $error)")
+        }
         val items = ArrayList<RecordItem>()
         var truncated = false
         try {
