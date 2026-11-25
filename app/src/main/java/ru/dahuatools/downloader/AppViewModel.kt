@@ -385,7 +385,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         p2pReconnectMutex.withLock {
             val health = P2pBridge.health()
             DiagnosticLog.write("INFO", "P2P/HEALTH", health)
-            if (P2pBridge.isRunning()) return@withLock
+            if (P2pBridge.isRunning() && !health.contains("retired=true")) return@withLock
             if (p2pPassword.isBlank()) {
                 throw SdkException("P2P-туннель потерян. Нужен повторный вход: пароль не хранится на диске.")
             }
