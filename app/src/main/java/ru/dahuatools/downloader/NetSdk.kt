@@ -17,6 +17,8 @@ import com.company.NetSDK.NET_RECORDFILE_INFO
 import com.company.NetSDK.NET_TIME
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.RandomAccessFile
 import java.time.LocalDateTime
@@ -51,6 +53,8 @@ object NetSdk {
     private var disconnectCb: CB_fDisConnect? = null
     private var reconnectCb: CB_fHaveReConnect? = null
     private val disconnectGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+    // Не допускаем гонку SetDeviceMode между параллельными DownloadByTimeEx.
+    private val byTimeDownloadMutex = Mutex()
 
     @Volatile
     var onEvent: ((String) -> Unit)? = null
@@ -304,6 +308,8 @@ object NetSdk {
         target: File,
         onProgress: (done: Long, total: Long) -> Unit
     ) {
+        byTimeDownloadMutex.withLock {
+            trace("BYTIME", "Ожидание безопасного слота видеопотока")
         val disconnectAtStart = disconnectGeneration.get()
         trace("BYTIME", "Старт: login=$login; channel0=$channel0; from=$from; to=$to; target=${target.absolutePath}")
         target.parentFile?.mkdirs()
@@ -447,6 +453,7 @@ object NetSdk {
             } catch (e: Throwable) {
                 trace("BYTIME", "StopDownload: ${e.javaClass.simpleName}: ${e.message}", true)
             }
+        }
         }
     }
 

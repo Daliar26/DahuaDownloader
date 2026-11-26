@@ -177,7 +177,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun updateParallel(n: Int) {
-        parallel = n.coerceIn(1, 3)
+        val requested = n.coerceIn(1, 3)
+        // Нельзя менять семафор, пока задания ожидают или используют старый.
+        if (running.isNotEmpty()) {
+            addLog("Лимит параллельности можно изменить после завершения текущих заданий")
+            return
+        }
+        parallel = requested
         semaphore = Semaphore(parallel)
         prefs.edit().putInt("parallel", parallel).apply()
     }
