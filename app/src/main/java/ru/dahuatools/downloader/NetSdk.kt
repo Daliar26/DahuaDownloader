@@ -50,6 +50,7 @@ object NetSdk {
     // Сильные ссылки, чтобы callback'и не собрал GC, пока их держит нативный код.
     private var disconnectCb: CB_fDisConnect? = null
     private var reconnectCb: CB_fHaveReConnect? = null
+    private val disconnectGeneration = java.util.concurrent.atomic.AtomicLong(0L)
 
     @Volatile
     var onEvent: ((String) -> Unit)? = null
@@ -94,6 +95,7 @@ object NetSdk {
         }
 
         val dc = CB_fDisConnect { _, ip, port ->
+            disconnectGeneration.incrementAndGet()
             onEvent?.invoke("Связь с $ip:$port потеряна, SDK пробует переподключиться")
         }
         val rc = CB_fHaveReConnect { _, ip, port ->
@@ -302,6 +304,7 @@ object NetSdk {
         target: File,
         onProgress: (done: Long, total: Long) -> Unit
     ) {
+        val disconnectAtStart = disconnectGeneration.get()
         trace("BYTIME", "Старт: login=$login; channel0=$channel0; from=$from; to=$to; target=${target.absolutePath}")
         target.parentFile?.mkdirs()
         target.delete()
@@ -414,6 +417,9 @@ object NetSdk {
         try {
             while (!finished.await(250, java.util.concurrent.TimeUnit.MILLISECONDS)) {
                 currentCoroutineContext().ensureActive()
+                if (disconnectGeneration.get() != disconnectAtStart) {
+                    throw SdkException("Связь NetSDK оборвалась во время выгрузки; требуется восстановление P2P")
+                }
                 val done = doneKbRef.get()
                 if (done != lastBytes) {
                     lastBytes = done

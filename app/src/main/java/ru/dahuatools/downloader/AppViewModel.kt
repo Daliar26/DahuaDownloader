@@ -693,7 +693,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                 val recoverableP2pFailure = p2pEnabled &&
                                     (errorText.contains("0x80000204", ignoreCase = true) ||
                                      errorText.contains("0x80000066", ignoreCase = true) ||
-                                     errorText.contains("Нет данных от регистратора более 2 минут", ignoreCase = true))
+                                     errorText.contains("Нет данных от регистратора более 2 минут", ignoreCase = true) ||
+                                     errorText.contains("Связь NetSDK оборвалась", ignoreCase = true))
                                 if (!recoverableP2pFailure || attempt >= 1) throw e
                                 attempt++
                                 DiagnosticLog.write(

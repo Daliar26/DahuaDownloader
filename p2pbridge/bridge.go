@@ -157,9 +157,10 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 	stateMu.Unlock()
 
 	client.SetOnClose(func() {
-		recordDiagnostic("ERROR", serial, username, password, "P2P tunnel OnClose: удалённая сторона закрыла туннель")
+		recordDiagnostic("ERROR", serial, username, password, "P2P tunnel OnClose: туннель закрыт; останавливаю listener и активные TCP relay")
 		b.closeListener()
-		remember("P2P-туннель закрыт удалённой стороной")
+		b.closeConnections()
+		remember("P2P-туннель закрыт удалённой стороной; активные TCP-соединения остановлены")
 	})
 	recordDiagnostic("INFO", serial, username, password, "P2P handshake успешен; локальный TCP listener=%d -> devicePort=%d", localPort, devicePort)
 	go b.serve()
@@ -204,8 +205,7 @@ func (b *bridge) closeListener() {
 	})
 }
 
-func (b *bridge) close() {
-	b.closeListener()
+func (b *bridge) closeConnections() {
 	b.mu.Lock()
 	conns := make([]net.Conn, 0, len(b.conns))
 	for c := range b.conns {
@@ -215,6 +215,11 @@ func (b *bridge) close() {
 	for _, c := range conns {
 		_ = c.Close()
 	}
+}
+
+func (b *bridge) close() {
+	b.closeListener()
+	b.closeConnections()
 	_ = b.client.Close()
 	b.wg.Wait()
 }
@@ -241,6 +246,11 @@ func (b *bridge) serve() {
 
 func (b *bridge) handle(local net.Conn) {
 	recordDiagnostic("INFO", "", "", "", "Принято локальное TCP-подключение от NetSDK")
+	if tcp, ok := local.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
+		_ = tcp.SetNoDelay(true)
+	}
 	defer local.Close()
 	b.mu.Lock()
 	b.conns[local] = struct{}{}
@@ -278,16 +288,30 @@ func (b *bridge) handle(local net.Conn) {
 	}()
 
 	recordDiagnostic("INFO", "", "", "", "Удалённый TCP realm открыт; activeRealms=%d", b.client.ActiveRealms())
-	errCh := make(chan error, 2)
-	go func() { _, e := io.Copy(remote, local); errCh <- e }()
-	go func() { _, e := io.Copy(local, remote); errCh <- e }()
-	copyErr := <-errCh
-	if copyErr != nil {
-		recordDiagnostic("WARN", "", "", "", "TCP relay завершился: %v", copyErr)
+	type relayResult struct {
+		direction string
+		bytes int64
+		err error
 	}
+	errCh := make(chan relayResult, 2)
+	started := time.Now()
+	go func() {
+		n, e := io.Copy(remote, local)
+		errCh <- relayResult{"local->device", n, e}
+	}()
+	go func() {
+		n, e := io.Copy(local, remote)
+		errCh <- relayResult{"device->local", n, e}
+	}()
+	first := <-errCh
+	recordDiagnostic("WARN", "", "", "", "TCP relay: направление %s завершилось; bytes=%d; elapsed=%s; err=%v",
+		first.direction, first.bytes, time.Since(started).Round(time.Millisecond), first.err)
 	_ = local.Close()
 	_ = remote.Close()
-	<-errCh
+	second := <-errCh
+	recordDiagnostic("INFO", "", "", "", "TCP relay закрыт: %s=%d bytes; %s=%d bytes; elapsed=%s; activeRealms=%d",
+		first.direction, first.bytes, second.direction, second.bytes,
+		time.Since(started).Round(time.Millisecond), b.client.ActiveRealms())
 }
 
 var _ = errors.Is
