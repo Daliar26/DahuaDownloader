@@ -353,17 +353,23 @@ object NetSdk {
 
         var selectedStream = -1
         var handle = 0L
-        var noRecordCodes = mutableListOf<String>()
+        val attemptErrors = mutableListOf<String>()
+
+        // Ошибка запуска одного потока не должна прекращать проверку остальных.
+        // Особенно важно для NVR, где DownloadByTimeEx может отклонять stream=0,
+        // хотя архив найден и запись доступна в дополнительном потоке.
         for (stream in 0..2) {
             if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, stream)) {
                 val code = lastError()
-                trace("BYTIME", "SetDeviceMode stream=$stream отклонён; SDK=$code", true)
-                if (stream == 0) throw SdkException("Не удалось выбрать поток записи (SDK $code)")
+                attemptErrors.add("stream=$stream SetDeviceMode=$code")
+                trace("BYTIME", "SetDeviceMode stream=$stream отклонён; SDK=$code; пробую следующий поток", true)
                 continue
             }
+
             target.delete()
-            trace("BYTIME", "Пробую поток записи stream=$stream")
-            handle = try {
+            trace("BYTIME", "Пробую DownloadByTimeEx stream=$stream")
+
+            val attemptHandle = try {
                 INetSDK.DownloadByTimeEx(
                     login,
                     channel0,
@@ -377,25 +383,26 @@ object NetSdk {
                 )
             } catch (e: Throwable) {
                 val code = lastError()
-                trace("BYTIME", "DownloadByTimeEx stream=$stream: ${e.javaClass.simpleName}: ${e.message}; SDK=$code", true)
-                throw SdkException("DownloadByTimeEx: ${e.message}; SDK $code")
+                attemptErrors.add("stream=$stream exception=${e.javaClass.simpleName} SDK=$code")
+                trace("BYTIME", "Исключение на stream=$stream: ${e.javaClass.simpleName}: ${e.message}; SDK=$code; пробую следующий поток", true)
+                continue
             }
-            if (handle != 0L) {
+
+            if (attemptHandle != 0L) {
+                handle = attemptHandle
                 selectedStream = stream
                 break
             }
+
             val code = lastError()
-            trace("BYTIME", "Нет записи/запуск отклонён на stream=$stream; SDK=$code", true)
-            if (code == "0x80000018") {
-                noRecordCodes.add("stream=$stream: $code")
-                continue
-            }
-            throw SdkException("DownloadByTimeEx не запустился на потоке $stream (SDK $code)")
+            attemptErrors.add("stream=$stream SDK=$code")
+            trace("BYTIME", "DownloadByTimeEx не запустился на stream=$stream; SDK=$code; пробую следующий поток", true)
         }
+
         if (handle == 0L) {
             throw SdkException(
-                "Регистратор не нашёл запись в выбранном канале и интервале ни в одном потоке " +
-                    "(${noRecordCodes.joinToString()}). Проверь канал и время записи."
+                "DownloadByTimeEx не запустился ни на одном потоке. " +
+                    "Результаты попыток: ${attemptErrors.joinToString("; ")}"
             )
         }
         trace("BYTIME", "Выбран поток записи stream=$selectedStream")
