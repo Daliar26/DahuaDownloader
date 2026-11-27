@@ -306,9 +306,26 @@ func (b *bridge) handle(local net.Conn) {
 	first := <-errCh
 	recordDiagnostic("WARN", "", "", "", "TCP relay: направление %s завершилось; bytes=%d; elapsed=%s; err=%v",
 		first.direction, first.bytes, time.Since(started).Round(time.Millisecond), first.err)
-	_ = local.Close()
-	_ = remote.Close()
-	second := <-errCh
+
+	var second relayResult
+	if first.direction == "local->device" && first.err == nil {
+		// NetSDK может закрыть свою сторону записи после отправки запроса,
+		// продолжая ждать ответ регистратора. Не обрываем обратный поток по EOF.
+		recordDiagnostic("INFO", "", "", "", "TCP relay: локальная сторона завершила отправку; оставляю device->local открытым для ответа")
+		select {
+		case second = <-errCh:
+		case <-time.After(10 * time.Minute):
+			recordDiagnostic("ERROR", "", "", "", "TCP relay: тайм-аут ожидания ответа регистратора после EOF локальной стороны")
+			_ = local.Close()
+			_ = remote.Close()
+			second = <-errCh
+		}
+	} else {
+		// Ошибка или завершение ответа регистратора — закрываем обе стороны.
+		_ = local.Close()
+		_ = remote.Close()
+		second = <-errCh
+	}
 	recordDiagnostic("INFO", "", "", "", "TCP relay закрыт: %s=%d bytes; %s=%d bytes; elapsed=%s; activeRealms=%d",
 		first.direction, first.bytes, second.direction, second.bytes,
 		time.Since(started).Round(time.Millisecond), b.client.ActiveRealms())
