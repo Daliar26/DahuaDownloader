@@ -35,11 +35,6 @@ var (
 
 const maxDiagnosticLines = 300
 
-// Keep the P2P UDP source port stable across reconnects. Some NATs assign
-// different external mappings to ephemeral ports, making subsequent hole
-// punches fail even when the initial cloud handshake succeeded.
-const localP2PUDPPort = 37779
-
 func recordDiagnostic(level, serial, username, password, format string, values ...any) {
 	message := fmt.Sprintf(format, values...)
 	for _, secret := range []string{serial, username, password} {
@@ -104,16 +99,16 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 		recordDiagnostic("ERROR", serial, username, password, format, values...)
 		remember(fmt.Sprintf(format, values...))
 	}
-	recordDiagnostic("INFO", serial, username, password, "Запуск P2P handshake; timeout=20s; maxRealms=4; fixedLocalUDP=%d", localP2PUDPPort)
+	recordDiagnostic("INFO", serial, username, password, "Запуск P2P handshake; timeout=20s; maxRealms=4")
 	cfg := dahua.Config{
 		Serial: serial, Username: username, Password: password,
-		Timeout: 20 * time.Second, P2PPort: localP2PUDPPort, MaxRealms: 4,
+		Timeout: 20 * time.Second, MaxRealms: 4,
 		Trace: trace, Error: reportError,
 	}
 	var client *dahua.Client
 	var err error
 	for attempt := 1; attempt <= 2; attempt++ {
-		recordDiagnostic("INFO", serial, username, password, "P2P handshake: попытка %d/2; localUDP=%d", attempt, localP2PUDPPort)
+		recordDiagnostic("INFO", serial, username, password, "P2P handshake: попытка %d/2", attempt)
 		client, err = dahua.ConnectWithConfig(cfg)
 		if err == nil {
 			break
@@ -124,12 +119,9 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 			return remember("P2P: Android/сеть запрещает исходящий UDP. Проверьте VPN, сетевой фильтр или другую сеть.")
 		}
 		var netErr net.Error
-		retryable := strings.Contains(errText, "timeout waiting for device response") ||
-			strings.Contains(errText, "connection timeout") ||
-			(errors.As(err, &netErr) && netErr.Timeout())
-		if attempt == 1 && retryable {
-			recordDiagnostic("WARN", serial, username, password, "P2P UDP hole-punch не получил ответ; повтор handshake через 3 секунды на том же local UDP port=%d: %v", localP2PUDPPort, err)
-			time.Sleep(3 * time.Second)
+		if attempt == 1 && errors.As(err, &netErr) && netErr.Timeout() {
+			recordDiagnostic("WARN", serial, username, password, "UDP handshake timeout; повтор через 2 секунды: %v", err)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 		break
@@ -140,7 +132,7 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 		if errors.As(err, &netErr) && netErr.Timeout() {
 			return remember(fmt.Sprintf("P2P: тайм-аут UDP-ответа облачного сервера Dahua: %v. Возможна блокировка UDP текущей сетью.", err))
 		}
-		return remember(fmt.Sprintf("P2P: %v. Прямой UDP hole-punch не получил ответ; медиареле в используемой библиотеке не реализовано.", err))
+		return remember(fmt.Sprintf("P2P: %v", err))
 	}
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort)))
@@ -277,8 +269,6 @@ func (b *bridge) handle(local net.Conn) {
 		return
 	}
 	b.client.WaitSettle()
-	recordDiagnostic("INFO", "", "", "", "Открываю P2P realm к TCP-порту регистратора %d; responsive15s=%t; activeRealms=%d; bindFailures=%d",
-		b.devicePort, b.client.IsResponsive(15*time.Second), b.client.ActiveRealms(), b.client.BindFailures())
 	remote, err := b.client.Dial(b.devicePort)
 	b.client.DoneNegotiate()
 	b.client.UnlockNegotiate()
