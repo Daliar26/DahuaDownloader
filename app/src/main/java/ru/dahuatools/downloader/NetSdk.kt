@@ -440,7 +440,7 @@ object NetSdk {
             // запросы через уже нестабильный P2P-туннель и ускоряет его отказ.
             if (code.equals("0x80000002", ignoreCase = true)) {
                 throw SdkException(
-                    "NetSDK сообщил NET_NETWORK_ERROR при запуске stream=$stream. " +
+                    "NetSDK сообщил NET_NETWORK_ERROR при запуске stream=$stream (SDK $code). " +
                         "Останавливаю перебор потоков и передаю управление восстановлению P2P."
                 )
             }
