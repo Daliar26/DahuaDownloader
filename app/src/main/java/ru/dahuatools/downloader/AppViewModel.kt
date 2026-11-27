@@ -278,7 +278,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (useP2p) {
                         addLog("P2P: запуск моста; ожидаю локальный TCP-прокси")
                         val p2pError = P2pBridge.start(serial, login, pass, 37778, 37777)
-                        if (p2pError.isNotBlank()) throw SdkException(p2pError)
+                        if (p2pError.isNotBlank()) {
+                            DiagnosticLog.write("ERROR", "P2P/START", "$p2pError\n${P2pBridge.diagnostics()}")
+                            throw SdkException(p2pError)
+                        }
                         p2pStarted = true
                         addLog("P2P-туннель установлен; проверяю соединение NetSDK")
                     }
@@ -424,6 +427,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             P2pBridge.stop()
             val startError = P2pBridge.start(p2pSerial.trim(), user.trim(), p2pPassword, 37778, 37777)
             if (startError.isNotBlank()) {
+                val failedDiagnostics = P2pBridge.diagnostics()
+                DiagnosticLog.write("ERROR", "P2P/RECONNECT", "$startError\n$failedDiagnostics")
                 throw SdkException("Не удалось восстановить P2P: $startError")
             }
             p2pStarted = true
