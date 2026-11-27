@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +29,50 @@ var (
 	stateMu   sync.Mutex
 	current   *bridge
 	lastError string
+	diagMu    sync.Mutex
+	diagLines []string
 )
+
+const maxDiagnosticLines = 300
+
+func recordDiagnostic(level, serial, username, password, format string, values ...any) {
+	message := fmt.Sprintf(format, values...)
+	for _, secret := range []string{serial, username, password} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[скрыто]")
+		}
+	}
+	line := time.Now().Format("2006-01-02 15:04:05.000") + " [" + level + "] " + message
+	diagMu.Lock()
+	diagLines = append(diagLines, line)
+	if len(diagLines) > maxDiagnosticLines {
+		diagLines = append([]string(nil), diagLines[len(diagLines)-maxDiagnosticLines:]...)
+	}
+	diagMu.Unlock()
+}
+
+func Diagnostics() string {
+	diagMu.Lock()
+	defer diagMu.Unlock()
+	return strings.Join(diagLines, "\n")
+}
+
+func Health() string {
+	stateMu.Lock()
+	b := current
+	errText := lastError
+	stateMu.Unlock()
+	if b == nil {
+		return "running=false; lastError=" + errText
+	}
+	closed := b.client.IsClosed()
+	responsive := b.client.IsResponsive(15 * time.Second)
+	retired := b.client.IsRetired()
+	realms := b.client.ActiveRealms()
+	bindFailures := b.client.BindFailures()
+	return fmt.Sprintf("running=%t; closed=%t; responsive15s=%t; retired=%t; realms=%d; bindFailures=%d; lastError=%s",
+		!closed, closed, responsive, retired, realms, bindFailures, errText)
+}
 
 // Start opens a Dahua cloud P2P tunnel and exposes the device TCP service on
 // loopback. The password is used only for the live handshake and is never
@@ -48,11 +92,46 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 		return "Некорректный порт P2P"
 	}
 
-	client, err := dahua.ConnectWithConfig(dahua.Config{
+	trace := func(format string, values ...any) {
+		recordDiagnostic("TRACE", serial, username, password, format, values...)
+	}
+	reportError := func(format string, values ...any) {
+		recordDiagnostic("ERROR", serial, username, password, format, values...)
+		remember(fmt.Sprintf(format, values...))
+	}
+	recordDiagnostic("INFO", serial, username, password, "Запуск P2P handshake; timeout=20s; maxRealms=4")
+	cfg := dahua.Config{
 		Serial: serial, Username: username, Password: password,
 		Timeout: 20 * time.Second, MaxRealms: 4,
-	})
+		Trace: trace, Error: reportError,
+	}
+	var client *dahua.Client
+	var err error
+	for attempt := 1; attempt <= 2; attempt++ {
+		recordDiagnostic("INFO", serial, username, password, "P2P handshake: попытка %d/2", attempt)
+		client, err = dahua.ConnectWithConfig(cfg)
+		if err == nil {
+			break
+		}
+		errText := strings.ToLower(err.Error())
+		if strings.Contains(errText, "operation not permitted") || strings.Contains(errText, "permission denied") {
+			recordDiagnostic("ERROR", serial, username, password, "UDP запрещён системой или сетевым фильтром; повтор handshake остановлен: %v", err)
+			return remember("P2P: Android/сеть запрещает исходящий UDP. Проверьте VPN, сетевой фильтр или другую сеть.")
+		}
+		var netErr net.Error
+		if attempt == 1 && errors.As(err, &netErr) && netErr.Timeout() {
+			recordDiagnostic("WARN", serial, username, password, "UDP handshake timeout; повтор через 2 секунды: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		break
+	}
 	if err != nil {
+		recordDiagnostic("ERROR", serial, username, password, "Handshake завершился ошибкой: %v", err)
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return remember(fmt.Sprintf("P2P: тайм-аут UDP-ответа облачного сервера Dahua: %v. Возможна блокировка UDP текущей сетью.", err))
+		}
 		return remember(fmt.Sprintf("P2P: %v", err))
 	}
 
@@ -78,9 +157,12 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 	stateMu.Unlock()
 
 	client.SetOnClose(func() {
+		recordDiagnostic("ERROR", serial, username, password, "P2P tunnel OnClose: туннель закрыт; останавливаю listener и активные TCP relay")
 		b.closeListener()
-		remember("P2P-туннель закрыт удалённой стороной")
+		b.closeConnections()
+		remember("P2P-туннель закрыт удалённой стороной; активные TCP-соединения остановлены")
 	})
+	recordDiagnostic("INFO", serial, username, password, "P2P handshake успешен; локальный TCP listener=%d -> devicePort=%d", localPort, devicePort)
 	go b.serve()
 	return ""
 }
@@ -123,8 +205,7 @@ func (b *bridge) closeListener() {
 	})
 }
 
-func (b *bridge) close() {
-	b.closeListener()
+func (b *bridge) closeConnections() {
 	b.mu.Lock()
 	conns := make([]net.Conn, 0, len(b.conns))
 	for c := range b.conns {
@@ -134,6 +215,11 @@ func (b *bridge) close() {
 	for _, c := range conns {
 		_ = c.Close()
 	}
+}
+
+func (b *bridge) close() {
+	b.closeListener()
+	b.closeConnections()
 	_ = b.client.Close()
 	b.wg.Wait()
 }
@@ -159,6 +245,12 @@ func (b *bridge) serve() {
 }
 
 func (b *bridge) handle(local net.Conn) {
+	recordDiagnostic("INFO", "", "", "", "Принято локальное TCP-подключение от NetSDK")
+	if tcp, ok := local.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
+		_ = tcp.SetNoDelay(true)
+	}
 	defer local.Close()
 	b.mu.Lock()
 	b.conns[local] = struct{}{}
@@ -172,6 +264,7 @@ func (b *bridge) handle(local net.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	if err := b.client.LockNegotiate(ctx); err != nil {
+		recordDiagnostic("ERROR", "", "", "", "LockNegotiate: %v", err)
 		remember(fmt.Sprintf("P2P: ожидание канала: %v", err))
 		return
 	}
@@ -180,6 +273,7 @@ func (b *bridge) handle(local net.Conn) {
 	b.client.DoneNegotiate()
 	b.client.UnlockNegotiate()
 	if err != nil {
+		recordDiagnostic("ERROR", "", "", "", "Dial devicePort=%d failed: %v; closed=%t; responsive15s=%t; bindFailures=%d", b.devicePort, err, b.client.IsClosed(), b.client.IsResponsive(15*time.Second), b.client.BindFailures())
 		remember(fmt.Sprintf("P2P: не удалось открыть TCP-порт регистратора %d: %v", b.devicePort, err))
 		return
 	}
@@ -193,13 +287,48 @@ func (b *bridge) handle(local net.Conn) {
 		b.mu.Unlock()
 	}()
 
-	errCh := make(chan error, 2)
-	go func() { _, e := io.Copy(remote, local); errCh <- e }()
-	go func() { _, e := io.Copy(local, remote); errCh <- e }()
-	<-errCh
-	_ = local.Close()
-	_ = remote.Close()
-	<-errCh
+	recordDiagnostic("INFO", "", "", "", "Удалённый TCP realm открыт; activeRealms=%d", b.client.ActiveRealms())
+	type relayResult struct {
+		direction string
+		bytes int64
+		err error
+	}
+	errCh := make(chan relayResult, 2)
+	started := time.Now()
+	go func() {
+		n, e := io.Copy(remote, local)
+		errCh <- relayResult{"local->device", n, e}
+	}()
+	go func() {
+		n, e := io.Copy(local, remote)
+		errCh <- relayResult{"device->local", n, e}
+	}()
+	first := <-errCh
+	recordDiagnostic("WARN", "", "", "", "TCP relay: направление %s завершилось; bytes=%d; elapsed=%s; err=%v",
+		first.direction, first.bytes, time.Since(started).Round(time.Millisecond), first.err)
+
+	var second relayResult
+	if first.direction == "local->device" && first.err == nil {
+		// NetSDK может закрыть свою сторону записи после отправки запроса,
+		// продолжая ждать ответ регистратора. Не обрываем обратный поток по EOF.
+		recordDiagnostic("INFO", "", "", "", "TCP relay: локальная сторона завершила отправку; оставляю device->local открытым для ответа")
+		select {
+		case second = <-errCh:
+		case <-time.After(10 * time.Minute):
+			recordDiagnostic("ERROR", "", "", "", "TCP relay: тайм-аут ожидания ответа регистратора после EOF локальной стороны")
+			_ = local.Close()
+			_ = remote.Close()
+			second = <-errCh
+		}
+	} else {
+		// Ошибка или завершение ответа регистратора — закрываем обе стороны.
+		_ = local.Close()
+		_ = remote.Close()
+		second = <-errCh
+	}
+	recordDiagnostic("INFO", "", "", "", "TCP relay закрыт: %s=%d bytes; %s=%d bytes; elapsed=%s; activeRealms=%d",
+		first.direction, first.bytes, second.direction, second.bytes,
+		time.Since(started).Round(time.Millisecond), b.client.ActiveRealms())
 }
 
 var _ = errors.Is

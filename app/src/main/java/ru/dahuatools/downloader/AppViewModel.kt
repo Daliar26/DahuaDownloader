@@ -13,10 +13,13 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -27,6 +30,8 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** Сколько раз пробовать докачать файл автоматически после восстановления связи. */
 private const val MAX_AUTO_RETRIES = 3
@@ -55,6 +60,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var p2pSerial by mutableStateOf(prefs.getString("p2p_serial", "") ?: "")
     private var p2pStarted = false
+    private var p2pPassword = ""
+    private val p2pReconnectMutex = Mutex()
     var connected by mutableStateOf(false)
         private set
     var busy by mutableStateOf(false)
@@ -86,7 +93,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val jobs = mutableStateListOf<DownloadJob>()
     val log = mutableStateListOf<String>()
 
-    private var loginHandle = 0L
+    @Volatile private var loginHandle = 0L
     private val running = HashMap<String, Job>()
     private var semaphore = Semaphore(parallel)
 
@@ -171,7 +178,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun updateParallel(n: Int) {
-        parallel = n.coerceIn(1, 3)
+        val requested = n.coerceIn(1, 3)
+        // Нельзя менять семафор, пока задания ожидают или используют старый.
+        if (running.isNotEmpty()) {
+            addLog("Лимит параллельности можно изменить после завершения текущих заданий")
+            return
+        }
+        parallel = requested
         semaphore = Semaphore(parallel)
         prefs.edit().putInt("parallel", parallel).apply()
     }
@@ -256,6 +269,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val serial = p2pSerial.trim()
         val login = user.trim()
         val pass = password
+        if (useP2p) p2pPassword = pass
         busy = true
         status = if (useP2p) "Подключение через Dahua P2P…" else "Подключение…"
         viewModelScope.launch {
@@ -292,14 +306,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 tab = 1
             } catch (e: CancellationException) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
+                p2pPassword = ""
                 throw e
             } catch (e: SdkException) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
+                p2pPassword = ""
                 status = e.message ?: "Ошибка"
                 DiagnosticLog.write("ERROR", "CONNECT", "SdkException: ${e.message}")
                 addLog("Ошибка подключения: ${e.message}")
             } catch (e: Throwable) {
                 if (p2pStarted) withContext(Dispatchers.IO) { P2pBridge.stop(); p2pStarted = false }
+                p2pPassword = ""
                 status = "Сбой: ${e.javaClass.simpleName}: ${e.message}"
                 DiagnosticLog.write("ERROR", "CONNECT", "Необработанное исключение ${e.javaClass.name}: ${e.message}")
                 addLog(status)
@@ -324,6 +341,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         P2pBridge.stop()
                         p2pStarted = false
                     }
+                    p2pPassword = ""
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -345,7 +363,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun onConnectionRestored() {
         viewModelScope.launch(Dispatchers.Main.immediate) {
             val candidates = jobs.filter {
-                it.status == JobStatus.ERROR && it.retryCount < MAX_AUTO_RETRIES && !running.containsKey(it.id)
+                it.status == JobStatus.ERROR && it.deviceFile != "__DOWNLOAD_BY_TIME__" &&
+                    it.retryCount < MAX_AUTO_RETRIES && !running.containsKey(it.id)
             }
             if (candidates.isEmpty()) return@launch
             addLog("Связь восстановлена — продолжаю ${candidates.size} загрузку(и) с места обрыва")
@@ -361,6 +380,73 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 launchJob(job.id)
             }
             persistJobs()
+        }
+    }
+
+
+    /**
+     * Проверяет P2P перед каждой архивной операцией. Если библиотека уже закрыла
+     * туннель, создаёт новый и обязательно выполняет новый NetSDK login:
+     * старый loginHandle привязан к прежнему TCP-соединению.
+     */
+    private suspend fun ensureP2pSession(
+        forceReconnect: Boolean = false,
+        staleHandle: Long? = null
+    ) {
+        if (!p2pEnabled) return
+        p2pReconnectMutex.withLock {
+            val health = P2pBridge.health()
+            val bridgeDiagnostics = P2pBridge.diagnostics()
+            val healthy = P2pBridge.isRunning() &&
+                health.contains("closed=false") &&
+                health.contains("responsive15s=true") &&
+                health.contains("retired=false") &&
+                health.contains("bindFailures=0")
+            DiagnosticLog.write(
+                if (healthy) "INFO" else "WARN",
+                "P2P/HEALTH",
+                "healthy=$healthy; $health\n$bridgeDiagnostics"
+            )
+            // Если другая параллельная задача уже восстановила loginHandle, не рвём её новое соединение.
+            if (forceReconnect && staleHandle != null && loginHandle != staleHandle && healthy) {
+                DiagnosticLog.write("INFO", "P2P/RECOVERY", "Другой поток уже обновил loginHandle; повторное восстановление не требуется")
+                return@withLock
+            }
+            // Не считаем туннель рабочим только потому, что Go-клиент ещё не пометил его закрытым.
+            if (!forceReconnect && healthy) return@withLock
+            if (p2pPassword.isBlank()) {
+                throw SdkException("P2P-туннель потерян. Нужен повторный вход: пароль не хранится на диске.")
+            }
+            addLog("P2P: туннель недоступен или не отвечает; выполняю переподключение и новый вход NetSDK")
+            DiagnosticLog.write("ERROR", "P2P/RECOVERY", "Туннель unhealthy/forceReconnect=$forceReconnect; health=$health; начинаю восстановление")
+            val oldHandle = loginHandle
+            if (oldHandle != 0L) runCatching { NetSdk.logout(oldHandle) }
+            P2pBridge.stop()
+            val startError = P2pBridge.start(p2pSerial.trim(), user.trim(), p2pPassword, 37778, 37777)
+            if (startError.isNotBlank()) {
+                throw SdkException("Не удалось восстановить P2P: $startError")
+            }
+            p2pStarted = true
+            try {
+                val info = NetSdk.login("127.0.0.1", 37778, user.trim(), p2pPassword)
+                loginHandle = info.handle
+                withContext(Dispatchers.Main.immediate) {
+                    connected = true
+                    status = "Подключено (P2P восстановлен)"
+                    deviceInfo = "Каналов: ${info.channels}, SN: ${info.serial}, соединение: Dahua P2P"
+                }
+                addLog("P2P восстановлен; NetSDK login выполнен заново")
+                DiagnosticLog.write("INFO", "P2P/RECOVERY", "Новый login успешен; handle=${info.handle}")
+            } catch (e: Throwable) {
+                P2pBridge.stop()
+                p2pStarted = false
+                loginHandle = 0L
+                withContext(Dispatchers.Main.immediate) {
+                    connected = false
+                    status = "P2P потерян — подключитесь заново"
+                }
+                throw e
+            }
         }
     }
 
@@ -380,9 +466,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 addLog("Поиск архива: канал=${q.channel0 + 1}, с=${q.from}, по=${q.to}")
                 val res = withContext(Dispatchers.IO) {
-                    NetSdk.findRecordings(
-                        loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
-                    )
+                    ensureP2pSession()
+                    val handleUsed = loginHandle
+                    try {
+                        NetSdk.findRecordings(
+                            handleUsed, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
+                        )
+                    } catch (e: SdkException) {
+                        val code = e.message.orEmpty()
+                        if (p2pEnabled && (code.contains("0x80000204") || code.contains("0x80000181"))) {
+                            DiagnosticLog.write("WARN", "SEARCH/RECOVERY", "FindFile failed on P2P handle=$handleUsed; one reconnect-and-retry: $code")
+                            ensureP2pSession(forceReconnect = true, staleHandle = handleUsed)
+                            NetSdk.findRecordings(
+                                loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
+                            )
+                        } else throw e
+                    }
                 }
                 found.addAll(res.items)
                 shownCount = 20
@@ -434,6 +533,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (existing != null) {
             if (existing.active) {
                 message = "Этот интервал уже в загрузках"
+                return
+            }
+            if (existing.deviceFile == marker && existing.status == JobStatus.ERROR) {
+                message = "Этот интервал уже завершился ошибкой. Изучите журнал; повторный запуск — вручную кнопкой «Повторить»."
+                addLog("Автоповтор единого интервала заблокирован после предыдущей ошибки")
                 return
             }
             retryJob(existing.id)
@@ -565,23 +669,54 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         (if (resuming) "Продолжение: " else "Старт: ") + job.title +
                             if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else if (byTime) " (единый файл за интервал)" else ""
                     )
+                    val progressLastAt = AtomicLong(0L)
+                    val progressLastPct = AtomicInteger(-1)
                     withContext(Dispatchers.IO) {
-                        if (byTime) {
-                            NetSdk.downloadByTime(
-                                loginHandle, job.camera - 1,
-                                NetSdk.parseDateTime(job.from), NetSdk.parseDateTime(job.to), tmpDav
-                            ) { done, total ->
-                                val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
-                                viewModelScope.launch(Dispatchers.Main.immediate) {
-                                    update(id) { it.copy(progress = pct) }
+                        ensureP2pSession()
+                        suspend fun transfer(handle: Long) {
+                            if (byTime) {
+                                NetSdk.downloadByTime(
+                                    handle, job.camera - 1,
+                                    NetSdk.parseDateTime(job.from), NetSdk.parseDateTime(job.to), tmpDav
+                                ) { done, total ->
+                                    val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
+                                    publishProgress(id, pct, progressLastAt, progressLastPct)
+                                }
+                            } else {
+                                NetSdk.downloadFilePiece(handle, job.deviceFile, tmpDav) { done, total ->
+                                    val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
+                                    publishProgress(id, pct, progressLastAt, progressLastPct)
                                 }
                             }
-                        } else {
-                            NetSdk.downloadFilePiece(loginHandle, job.deviceFile, tmpDav) { done, total ->
-                                val pct = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
-                                viewModelScope.launch(Dispatchers.Main.immediate) {
-                                    update(id) { it.copy(progress = pct) }
-                                }
+                        }
+                        var attempt = 0
+                        while (true) {
+                            val handleUsed = loginHandle
+                            try {
+                                transfer(handleUsed)
+                                break
+                            } catch (e: SdkException) {
+                                val errorText = e.message.orEmpty()
+                                val recoverableP2pFailure = p2pEnabled &&
+                                    (errorText.contains("0x80000204", ignoreCase = true) ||
+                                     errorText.contains("0x80000066", ignoreCase = true) ||
+                                     errorText.contains("0x80000002", ignoreCase = true) ||
+                                     errorText.contains("NET_NETWORK_ERROR", ignoreCase = true) ||
+                                     errorText.contains("Нет данных от регистратора более 2 минут", ignoreCase = true) ||
+                                     errorText.contains("Связь NetSDK оборвалась", ignoreCase = true) ||
+                                     errorText.contains("обрыв при скачивании", ignoreCase = true))
+                                if (!recoverableP2pFailure || attempt >= MAX_AUTO_RETRIES) throw e
+                                attempt++
+                                val backoffMs = 1000L shl (attempt - 1)
+                                DiagnosticLog.write(
+                                    "WARN", "DOWNLOAD/RECOVERY",
+                                    "Передача оборвалась (attempt=$attempt/$MAX_AUTO_RETRIES, handle=$handleUsed): $errorText. " +
+                                        "Пауза ${backoffMs}мс, затем пересоздание P2P и новый NetSDK login."
+                                )
+                                addLog("Потеряна передача — восстановление P2P и повтор $attempt/$MAX_AUTO_RETRIES")
+                                delay(backoffMs)
+                                ensureP2pSession(forceReconnect = true, staleHandle = handleUsed)
+                                DiagnosticLog.write("INFO", "DOWNLOAD/RECOVERY", "P2P восстановлен; повтор с новым handle=$loginHandle")
                             }
                         }
                     }
@@ -649,11 +784,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------------ вспомогательное
 
-    private fun update(id: String, f: (DownloadJob) -> DownloadJob) {
+    // Ограничиваем обновление интерфейса двумя событиями в секунду.
+    // Частые callback SDK не должны запускать сотни Compose recomposition и JSON-записей.
+    private fun publishProgress(id: String, pct: Int, lastAt: AtomicLong, lastPct: AtomicInteger) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val previous = lastPct.get()
+        if (pct == previous) return
+        if (pct != 100 && now - lastAt.get() < 500L) return
+        if (!lastPct.compareAndSet(previous, pct)) return
+        lastAt.set(now)
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            update(id, persist = false) { it.copy(progress = pct) }
+        }
+    }
+
+    private fun update(id: String, persist: Boolean = true, f: (DownloadJob) -> DownloadJob) {
         val i = jobs.indexOfFirst { it.id == id }
         if (i >= 0) {
             jobs[i] = f(jobs[i])
-            persistJobs()
+            if (persist) persistJobs()
         }
     }
 

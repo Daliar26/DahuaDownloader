@@ -2,6 +2,7 @@ package ru.dahuatools.downloader
 
 import com.company.NetSDK.CB_fDisConnect
 import com.company.NetSDK.CB_fHaveReConnect
+import com.company.NetSDK.CB_fTimeDownLoadPosCallBack
 import com.company.NetSDK.CB_fSearchDevicesCB
 import com.company.NetSDK.EM_LOGIN_SPAC_CAP_TYPE
 import com.company.NetSDK.EM_QUERY_RECORD_TYPE
@@ -16,6 +17,8 @@ import com.company.NetSDK.NET_RECORDFILE_INFO
 import com.company.NetSDK.NET_TIME
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.io.RandomAccessFile
 import java.time.LocalDateTime
@@ -49,6 +52,9 @@ object NetSdk {
     // Сильные ссылки, чтобы callback'и не собрал GC, пока их держит нативный код.
     private var disconnectCb: CB_fDisConnect? = null
     private var reconnectCb: CB_fHaveReConnect? = null
+    private val disconnectGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+    // Не допускаем гонку SetDeviceMode между параллельными DownloadByTimeEx.
+    private val byTimeDownloadMutex = Mutex()
 
     @Volatile
     var onEvent: ((String) -> Unit)? = null
@@ -59,9 +65,18 @@ object NetSdk {
 
     fun lastError(): String = String.format("0x%08X", INetSDK.GetLastError())
 
+    private fun trace(stage: String, message: String, failed: Boolean = false) {
+        DiagnosticLog.write(if (failed) "ERROR" else "INFO", "NETSDK/$stage", message)
+        onEvent?.invoke("[$stage] $message")
+    }
+
+    private fun methodInfo(m: java.lang.reflect.Method) =
+        "${m.name}(${m.parameterTypes.joinToString { it.name }}) static=${java.lang.reflect.Modifier.isStatic(m.modifiers)}"
+
     @Synchronized
     fun ensureInit(log: (String) -> Unit) {
-        if (initialized) return
+        if (initialized) { trace("INIT", "SDK уже инициализирован"); return }
+        trace("INIT", "Начало инициализации NetSDK")
 
         // Порядок важен: libssl зависит от libcrypto.so.1.0.0 (SONAME у libcrypto.so именно такой).
         val libs = listOf(
@@ -75,6 +90,7 @@ object NetSdk {
         for ((name, required) in libs) {
             try {
                 System.loadLibrary(name)
+                trace("INIT", "System.loadLibrary($name): OK")
                 log("lib$name.so загружена")
             } catch (e: UnsatisfiedLinkError) {
                 log("lib$name.so: ${e.message}")
@@ -83,6 +99,7 @@ object NetSdk {
         }
 
         val dc = CB_fDisConnect { _, ip, port ->
+            disconnectGeneration.incrementAndGet()
             onEvent?.invoke("Связь с $ip:$port потеряна, SDK пробует переподключиться")
         }
         val rc = CB_fHaveReConnect { _, ip, port ->
@@ -97,7 +114,7 @@ object NetSdk {
         } catch (e: Throwable) {
             throw SdkException("INetSDK.Init: ${e.javaClass.simpleName}: ${e.message}")
         }
-        if (!ok) throw SdkException("INetSDK.Init вернул false")
+        if (!ok) { val code = lastError(); trace("INIT", "Init=false; SDK=$code", true); throw SdkException("INetSDK.Init вернул false (SDK $code)") }
 
         INetSDK.SetAutoReconnect(rc)
         INetSDK.SetConnectTime(5000, 1)
@@ -108,9 +125,12 @@ object NetSdk {
 
         initialized = true
         log("SDK инициализирован, версия ${INetSDK.GetSDKVersion()}")
+        trace("INIT", "Init успешно; версия=${INetSDK.GetSDKVersion()}")
+        INetSDK::class.java.methods.filter { it.name == "DownloadByTimeEx" || it.name == "SetDeviceMode" }.forEach { trace("API", methodInfo(it)) }
     }
 
     fun login(ip: String, port: Int, user: String, password: String): LoginInfo {
+        trace("LOGIN", "LoginWithHighLevelSecurity: $ip:$port; user=$user; пароль скрыт")
         val inp = NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY()
         putZ(ip, inp.szIP, "IP")
         putZ(user, inp.szUserName, "Логин")
@@ -122,6 +142,8 @@ object NetSdk {
         val out = NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY()
         val handle = INetSDK.LoginWithHighLevelSecurity(inp, out)
         if (handle == 0L) {
+            val code = lastError()
+            trace("LOGIN", "Login handle=0; nError=${out.nError}; SDK=$code", true)
             val di = out.stuDeviceInfo
             val left = if (di != null) (di.byLeftLogTimes.toInt() and 0xFF) else -1
             val extra = if (left in 0..9) ", осталось попыток до блокировки: $left" else ""
@@ -131,6 +153,7 @@ object NetSdk {
             )
         }
 
+        trace("LOGIN", "Login успешно; handle=$handle")
         val di = out.stuDeviceInfo
         val serial = String(di.sSerialNumber, Charsets.UTF_8).substringBefore('\u0000').trim()
         val time = NET_TIME()
@@ -156,20 +179,25 @@ object NetSdk {
         to: NET_TIME,
         limit: Int
     ): SearchResult {
+        trace("SEARCH", "FindFile: login=$login; channel0=$channel0; type=ALL; from=$from; to=$to; limit=$limit")
         // Dahua requires the recording stream type to be selected before archive
         // queries on some NVR firmware. Use the same mode as DownloadByTimeEx.
         if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
             val error = lastError()
+            trace("SEARCH", "SDK_RECORD_STREAM_TYPE=0 отклонён; SDK=$error", true)
             throw SdkException("SetDeviceMode перед FindFile завершился ошибкой SDK $error")
         }
+        trace("SEARCH", "SDK_RECORD_STREAM_TYPE=0 установлен")
 
         val h = INetSDK.FindFile(
             login, channel0, EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL, null, from, to, false, 10000
         )
         if (h == 0L) {
             val error = lastError() // capture immediately; later SDK calls overwrite it
+            trace("SEARCH", "FindFile вернул handle=0; SDK=$error", true)
             throw SdkException("FindFile вернул пустой handle (SDK $error)")
         }
+        trace("SEARCH", "FindFile handle=$h")
         val items = ArrayList<RecordItem>()
         var truncated = false
         try {
@@ -254,17 +282,31 @@ object NetSdk {
                 }
 
                 val got = out.nBufferLen
-                if (got <= 0) break
+                if (got < 0 || got > PIECE_CHUNK_BYTES || got > out.szBuffer.size) {
+                    throw SdkException("Некорректный размер блока DownloadPieceFile: $got")
+                }
+                if (got == 0) {
+                    if (total > 0 && offset < total) {
+                        throw SdkException("Регистратор вернул пустой блок до конца файла: $offset из $total байт")
+                    }
+                    break
+                }
+                if (total > 0 && offset + got > total) {
+                    throw SdkException("DownloadPieceFile вернул данные за пределами файла: ${offset + got} > $total")
+                }
                 raf.write(out.szBuffer, 0, got)
                 offset += got
                 onProgress(offset, total)
 
-                if (total in 1..offset) break
+                if (total > 0 && offset == total) break
             }
         }
 
         if (!target.exists() || target.length() == 0L) {
             throw SdkException("Файл не создан или пустой (в этом периоде может не быть записи)")
+        }
+        if (total > 0 && target.length() != total) {
+            throw SdkException("Файл скачан не полностью: ${target.length()} из $total байт. Частичный файл сохранён для продолжения.")
         }
     }
 
@@ -280,90 +322,140 @@ object NetSdk {
         target: File,
         onProgress: (done: Long, total: Long) -> Unit
     ) {
+        byTimeDownloadMutex.withLock {
+            trace("BYTIME", "Ожидание безопасного слота видеопотока")
+        val disconnectAtStart = disconnectGeneration.get()
+        trace("BYTIME", "Старт: login=$login; channel0=$channel0; from=$from; to=$to; target=${target.absolutePath}")
         target.parentFile?.mkdirs()
-        target.delete() // DownloadByTimeEx не поддерживает продолжение по байтовому смещению.
-        val api = INetSDK::class.java
-        // Android NetSDK Java demo uses the 9-argument DownloadByTimeEx overload.
-        val download = api.methods.firstOrNull {
-            it.name == "DownloadByTimeEx" && it.parameterTypes.size == 9
-        } ?: throw SdkException(
-            "INetSDK не содержит DownloadByTimeEx(9 параметров). Найдены методы: " +
-                api.methods.filter { it.name.contains("DownloadByTime", ignoreCase = true) }
-                    .joinToString { m -> m.name + "(" + m.parameterTypes.joinToString { it.simpleName } + ")" }
-                    .ifBlank { "нет методов DownloadByTime" }
-        )
+        target.delete()
 
-        if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, 0)) {
-            throw SdkException("Не удалось установить основной поток записи (SDK ${lastError()})")
-        }
-
-        val callbackType = download.parameterTypes[6]
-        if (!callbackType.isInterface) {
-            throw SdkException("Неизвестный тип callback DownloadByTimeEx: ${callbackType.name}")
-        }
+        // Официальный Dahua sample передаёт stream отдельно. На части NVR запись
+        // доступна не в основном потоке, поэтому пробуем main/extra/third.
         val finished = java.util.concurrent.CountDownLatch(1)
-        val totalRef = java.util.concurrent.atomic.AtomicLong(-1L)
-        val doneRef = java.util.concurrent.atomic.AtomicLong(0L)
+        val totalKbRef = java.util.concurrent.atomic.AtomicLong(-1L)
+        val doneKbRef = java.util.concurrent.atomic.AtomicLong(0L)
         val callbackError = java.util.concurrent.atomic.AtomicBoolean(false)
-        val callback = java.lang.reflect.Proxy.newProxyInstance(
-            callbackType.classLoader, arrayOf(callbackType)
-        ) { proxy, called, args ->
-            when (called.name) {
-                "toString" -> "DahuaTimeDownloadCallback"
-                "hashCode" -> System.identityHashCode(proxy)
-                "equals" -> proxy === args?.getOrNull(0)
-                else -> {
-                    val values = args ?: emptyArray()
-                    // Android Java callback: handle,total,downloaded,index,recordInfo.
-                    if (values.size >= 3) {
-                        val totalRaw = (values[1] as? Number)?.toLong() ?: -1L
-                        val doneRaw = (values[2] as? Number)?.toLong() ?: 0L
-                        if (doneRaw == -2L) {
-                            callbackError.set(true) // Dahua: failed / permission denied.
-                            finished.countDown()
-                        } else if (doneRaw == -1L) {
-                            finished.countDown() // Dahua: completed sentinel.
-                        } else {
-                            val total = totalRaw and 0xFFFFFFFFL
-                            val done = doneRaw and 0xFFFFFFFFL
-                            if (total > 0) totalRef.set(total)
-                            doneRef.set(done)
-                            onProgress(done, totalRef.get())
-                            if (total > 0 && done >= total) finished.countDown()
-                        }
+        val lastLoggedPercent = java.util.concurrent.atomic.AtomicInteger(-10)
+
+        val callback = object : CB_fTimeDownLoadPosCallBack {
+            override fun invoke(
+                lPlayHandle: Long,
+                dwTotalSize: Int,
+                dwDownLoadSize: Int,
+                index: Int,
+                recordfileinfo: NET_RECORDFILE_INFO
+            ) {
+                when (dwDownLoadSize) {
+                    -2 -> {
+                        callbackError.set(true)
+                        trace("CALLBACK", "Dahua сообщил ошибку записи (-2)", true)
+                        finished.countDown()
                     }
-                    null
+                    -1 -> {
+                        trace("CALLBACK", "Dahua сообщил завершение загрузки")
+                        finished.countDown()
+                    }
+                    else -> {
+                        val totalKb = dwTotalSize.toLong().coerceAtLeast(0L)
+                        val doneKb = dwDownLoadSize.toLong().coerceAtLeast(0L)
+                        if (totalKb > 0) totalKbRef.set(totalKb)
+                        doneKbRef.set(doneKb)
+                        val totalKbNow = totalKbRef.get()
+                        val pct = if (totalKbNow > 0) {
+                            ((doneKb * 100L) / totalKbNow).toInt().coerceIn(0, 100)
+                        } else -1
+                        val logged = lastLoggedPercent.get()
+                        if (pct >= 0 && pct / 10 > logged / 10 &&
+                            lastLoggedPercent.compareAndSet(logged, pct)
+                        ) trace("CALLBACK", "Прогресс DownloadByTimeEx: ${pct}%")
+                        onProgress(doneKb * 1024L, if (totalKbNow > 0) totalKbNow * 1024L else -1L)
+                    }
                 }
             }
         }
 
-        val args = arrayOfNulls<Any>(9)
-        args[0] = login
-        args[1] = channel0
-        args[2] = EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL
-        args[3] = netTime(from)
-        args[4] = netTime(to)
-        args[5] = target.absolutePath
-        args[6] = callback
-        args[7] = null
-        args[8] = null
+        var selectedStream = -1
+        var handle = 0L
+        val attemptErrors = mutableListOf<String>()
 
-        val handle = try {
-            (download.invoke(null, *args) as? Number)?.toLong() ?: 0L
-        } catch (e: Throwable) {
-            throw SdkException("DownloadByTimeEx: ${e.cause?.message ?: e.message}; SDK ${lastError()}")
+        // Ошибка запуска одного потока не должна прекращать проверку остальных.
+        // Особенно важно для NVR, где DownloadByTimeEx может отклонять stream=0,
+        // хотя архив найден и запись доступна в дополнительном потоке.
+        for (stream in 0..2) {
+            if (disconnectGeneration.get() != disconnectAtStart) {
+                throw SdkException("Связь NetSDK оборвалась до запуска stream=$stream; повтор с устаревшей сессией запрещён")
+            }
+            if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, stream)) {
+                val code = lastError()
+                attemptErrors.add("stream=$stream SetDeviceMode=$code")
+                trace("BYTIME", "SetDeviceMode stream=$stream отклонён; SDK=$code", true)
+                if (disconnectGeneration.get() != disconnectAtStart) {
+                    throw SdkException("Связь NetSDK оборвалась при выборе stream=$stream (SDK $code)")
+                }
+                continue
+            }
+            if (disconnectGeneration.get() != disconnectAtStart) {
+                throw SdkException("Связь NetSDK оборвалась после SetDeviceMode; stream=$stream не запускаю")
+            }
+
+            target.delete()
+            trace("BYTIME", "Пробую DownloadByTimeEx stream=$stream")
+
+            val attemptHandle = try {
+                INetSDK.DownloadByTimeEx(
+                    login,
+                    channel0,
+                    EM_QUERY_RECORD_TYPE.EM_RECORD_TYPE_ALL,
+                    netTime(from),
+                    netTime(to),
+                    target.absolutePath,
+                    callback,
+                    null,
+                    null
+                )
+            } catch (e: Throwable) {
+                val code = lastError()
+                attemptErrors.add("stream=$stream exception=${e.javaClass.simpleName} SDK=$code")
+                trace("BYTIME", "Исключение на stream=$stream: ${e.javaClass.simpleName}: ${e.message}; SDK=$code", true)
+                if (disconnectGeneration.get() != disconnectAtStart) {
+                    throw SdkException("Связь NetSDK оборвалась при запуске stream=$stream (SDK $code)")
+                }
+                continue
+            }
+
+            if (attemptHandle != 0L) {
+                handle = attemptHandle
+                selectedStream = stream
+                break
+            }
+
+            val code = lastError()
+            attemptErrors.add("stream=$stream SDK=$code")
+            trace("BYTIME", "DownloadByTimeEx не запустился на stream=$stream; SDK=$code", true)
+            if (disconnectGeneration.get() != disconnectAtStart) {
+                throw SdkException("Связь NetSDK оборвалась при запуске stream=$stream (SDK $code)")
+            }
         }
+
         if (handle == 0L) {
-            throw SdkException("DownloadByTimeEx не запустился (SDK ${lastError()})")
+            throw SdkException(
+                "DownloadByTimeEx не запустился ни на одном потоке. " +
+                    "Результаты попыток: ${attemptErrors.joinToString("; ")}"
+            )
         }
+        trace("BYTIME", "Выбран поток записи stream=$selectedStream")
 
+        trace("BYTIME", "DownloadByTimeEx запущен; handle=$handle")
         val startedAt = System.currentTimeMillis()
         var lastBytes = -1L
         var lastChangeAt = startedAt
         try {
             while (!finished.await(250, java.util.concurrent.TimeUnit.MILLISECONDS)) {
                 currentCoroutineContext().ensureActive()
-                val done = doneRef.get()
+                if (disconnectGeneration.get() != disconnectAtStart) {
+                    throw SdkException("Связь NetSDK оборвалась во время выгрузки; требуется восстановление P2P")
+                }
+                val done = doneKbRef.get()
                 if (done != lastBytes) {
                     lastBytes = done
                     lastChangeAt = System.currentTimeMillis()
@@ -376,20 +468,21 @@ object NetSdk {
                 }
             }
             if (callbackError.get()) {
-                throw SdkException("Регистратор отклонил выгрузку интервала (SDK ${lastError()})")
+                throw SdkException("Dahua не смог записать выходной файл (SDK ${lastError()})")
             }
             if (!target.exists() || target.length() == 0L) {
                 throw SdkException("Регистратор завершил выгрузку, но файл пустой (SDK ${lastError()})")
             }
+            trace("BYTIME", "Успешно завершено; file=${target.absolutePath}; bytes=${target.length()}")
             onProgress(target.length(), target.length())
         } finally {
             try {
-                val stop = api.methods.firstOrNull {
-                    it.name == "StopDownload" && it.parameterTypes.size == 1
-                }
-                stop?.invoke(null, handle)
-            } catch (_: Throwable) {
+                INetSDK.StopDownload(handle)
+                trace("BYTIME", "StopDownload(handle=$handle)")
+            } catch (e: Throwable) {
+                trace("BYTIME", "StopDownload: ${e.javaClass.simpleName}: ${e.message}", true)
             }
+        }
         }
     }
 
