@@ -379,15 +379,14 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 		return nil, fmt.Errorf("failed to send PTCP sync to agent: %w", err)
 	}
 
-	// Read SYNC response
-	syncResp, err := p2pClient.ReadRaw(opts.Timeout)
+	// The agent can emit a queued NAT-info/control datagram immediately
+	// before its PTCP reply. UDP preserves datagram boundaries, but ReadRaw
+	// returns the next datagram regardless of its payload. Do not mistake
+	// that non-PTCP datagram for the SYNC response: wait for a valid PTCP
+	// packet of the expected type within one overall timeout.
+	syncRespPacket, skipped, err := readExpectedPTCPPacket(p2pClient, opts.Timeout, ptcp.BodyTypeSync)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read PTCP sync response from agent: %w", err)
-	}
-
-	syncRespPacket, err := ptcp.ParsePacket(syncResp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse PTCP sync response: %w", err)
+		return nil, fmt.Errorf("failed to read PTCP sync response from agent (ignored %d non-SYNC datagrams): %w", skipped, err)
 	}
 	agentSession.Recv(syncRespPacket)
 
@@ -638,3 +637,33 @@ func performDirectHandshake(client *UDPClient, cid []byte, devicePubAddr, device
 
 	return session, nil
 }
+
+func readExpectedPTCPPacket(client *UDPClient, timeout time.Duration, expected ptcp.BodyType) (*ptcp.Packet, int, error) {
+	deadline := time.Now().Add(timeout)
+	skipped := 0
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, skipped, fmt.Errorf("timeout waiting for PTCP body type %d", expected)
+		}
+		data, err := client.ReadRaw(remaining)
+		if err != nil {
+			return nil, skipped, err
+		}
+		if len(data) < ptcp.HeaderSize || string(data[:4]) != string(ptcp.Magic) {
+			skipped++
+			continue
+		}
+		packet, err := ptcp.ParsePacket(data)
+		if err != nil {
+			skipped++
+			continue
+		}
+		if packet.Body.Type != expected {
+			skipped++
+			continue
+		}
+		return packet, skipped, nil
+	}
+}
+
