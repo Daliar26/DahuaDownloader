@@ -479,8 +479,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     } catch (e: SdkException) {
                         val code = e.message.orEmpty()
-                        if (p2pEnabled && (code.contains("0x80000204") || code.contains("0x80000181"))) {
-                            DiagnosticLog.write("WARN", "SEARCH/RECOVERY", "FindFile failed on P2P handle=$handleUsed; one reconnect-and-retry: $code")
+                        if (p2pEnabled && (
+                                code.contains("0x80000204", ignoreCase = true) ||
+                                code.contains("0x80000181", ignoreCase = true) ||
+                                code.contains("0x80000002", ignoreCase = true) ||
+                                code.contains("NET_NETWORK_ERROR", ignoreCase = true)
+                            )) {
+                            DiagnosticLog.write("WARN", "SEARCH/RECOVERY", "FindFile transport/session failure on P2P handle=$handleUsed; reconnect-and-retry once: $code")
                             ensureP2pSession(forceReconnect = true, staleHandle = handleUsed)
                             NetSdk.findRecordings(
                                 loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
