@@ -13,6 +13,7 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -699,18 +700,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                                 val recoverableP2pFailure = p2pEnabled &&
                                     (errorText.contains("0x80000204", ignoreCase = true) ||
                                      errorText.contains("0x80000066", ignoreCase = true) ||
+                                     errorText.contains("0x80000002", ignoreCase = true) ||
+                                     errorText.contains("NET_NETWORK_ERROR", ignoreCase = true) ||
                                      errorText.contains("Нет данных от регистратора более 2 минут", ignoreCase = true) ||
-                                     errorText.contains("Связь NetSDK оборвалась", ignoreCase = true))
-                                if (!recoverableP2pFailure || attempt >= 1) throw e
+                                     errorText.contains("Связь NetSDK оборвалась", ignoreCase = true) ||
+                                     errorText.contains("обрыв при скачивании", ignoreCase = true))
+                                if (!recoverableP2pFailure || attempt >= MAX_AUTO_RETRIES) throw e
                                 attempt++
+                                val backoffMs = 1000L shl (attempt - 1)
                                 DiagnosticLog.write(
                                     "WARN", "DOWNLOAD/RECOVERY",
-                                    "Передача оборвалась (attempt=$attempt, handle=$handleUsed): $errorText. " +
-                                        "Останавливаю старый поток, пересоздаю P2P и NetSDK login; затем повторю весь интервал."
+                                    "Передача оборвалась (attempt=$attempt/$MAX_AUTO_RETRIES, handle=$handleUsed): $errorText. " +
+                                        "Пауза ${backoffMs}мс, затем пересоздание P2P и новый NetSDK login."
                                 )
-                                addLog("Потеряна передача данных — восстанавливаю P2P и повторяю интервал (попытка $attempt/1)")
+                                addLog("Потеряна передача — восстановление P2P и повтор $attempt/$MAX_AUTO_RETRIES")
+                                delay(backoffMs)
                                 ensureP2pSession(forceReconnect = true, staleHandle = handleUsed)
-                                DiagnosticLog.write("INFO", "DOWNLOAD/RECOVERY", "P2P восстановлен; повтор DownloadByTimeEx/DownloadPieceFile с новым handle=$loginHandle")
+                                DiagnosticLog.write("INFO", "DOWNLOAD/RECOVERY", "P2P восстановлен; повтор с новым handle=$loginHandle")
                             }
                         }
                     }
