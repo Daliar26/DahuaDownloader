@@ -277,6 +277,8 @@ func (b *bridge) handle(local net.Conn) {
 		return
 	}
 	b.client.WaitSettle()
+	recordDiagnostic("INFO", "", "", "", "Открываю P2P realm к TCP-порту регистратора %d; responsive15s=%t; activeRealms=%d; bindFailures=%d",
+		b.devicePort, b.client.IsResponsive(15*time.Second), b.client.ActiveRealms(), b.client.BindFailures())
 	remote, err := b.client.Dial(b.devicePort)
 	b.client.DoneNegotiate()
 	b.client.UnlockNegotiate()
