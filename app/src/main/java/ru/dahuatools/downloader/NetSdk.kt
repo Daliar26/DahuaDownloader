@@ -282,17 +282,31 @@ object NetSdk {
                 }
 
                 val got = out.nBufferLen
-                if (got <= 0) break
+                if (got < 0 || got > PIECE_CHUNK_BYTES || got > out.szBuffer.size) {
+                    throw SdkException("Некорректный размер блока DownloadPieceFile: $got")
+                }
+                if (got == 0) {
+                    if (total > 0 && offset < total) {
+                        throw SdkException("Регистратор вернул пустой блок до конца файла: $offset из $total байт")
+                    }
+                    break
+                }
+                if (total > 0 && offset + got > total) {
+                    throw SdkException("DownloadPieceFile вернул данные за пределами файла: ${offset + got} > $total")
+                }
                 raf.write(out.szBuffer, 0, got)
                 offset += got
                 onProgress(offset, total)
 
-                if (total in 1..offset) break
+                if (total > 0 && offset == total) break
             }
         }
 
         if (!target.exists() || target.length() == 0L) {
             throw SdkException("Файл не создан или пустой (в этом периоде может не быть записи)")
+        }
+        if (total > 0 && target.length() != total) {
+            throw SdkException("Файл скачан не полностью: ${target.length()} из $total байт. Частичный файл сохранён для продолжения.")
         }
     }
 
@@ -368,11 +382,20 @@ object NetSdk {
         // Особенно важно для NVR, где DownloadByTimeEx может отклонять stream=0,
         // хотя архив найден и запись доступна в дополнительном потоке.
         for (stream in 0..2) {
+            if (disconnectGeneration.get() != disconnectAtStart) {
+                throw SdkException("Связь NetSDK оборвалась до запуска stream=$stream; повтор с устаревшей сессией запрещён")
+            }
             if (!INetSDK.SetDeviceMode(login, EM_USEDEV_MODE.SDK_RECORD_STREAM_TYPE, stream)) {
                 val code = lastError()
                 attemptErrors.add("stream=$stream SetDeviceMode=$code")
-                trace("BYTIME", "SetDeviceMode stream=$stream отклонён; SDK=$code; пробую следующий поток", true)
+                trace("BYTIME", "SetDeviceMode stream=$stream отклонён; SDK=$code", true)
+                if (disconnectGeneration.get() != disconnectAtStart) {
+                    throw SdkException("Связь NetSDK оборвалась при выборе stream=$stream (SDK $code)")
+                }
                 continue
+            }
+            if (disconnectGeneration.get() != disconnectAtStart) {
+                throw SdkException("Связь NetSDK оборвалась после SetDeviceMode; stream=$stream не запускаю")
             }
 
             target.delete()
@@ -393,7 +416,10 @@ object NetSdk {
             } catch (e: Throwable) {
                 val code = lastError()
                 attemptErrors.add("stream=$stream exception=${e.javaClass.simpleName} SDK=$code")
-                trace("BYTIME", "Исключение на stream=$stream: ${e.javaClass.simpleName}: ${e.message}; SDK=$code; пробую следующий поток", true)
+                trace("BYTIME", "Исключение на stream=$stream: ${e.javaClass.simpleName}: ${e.message}; SDK=$code", true)
+                if (disconnectGeneration.get() != disconnectAtStart) {
+                    throw SdkException("Связь NetSDK оборвалась при запуске stream=$stream (SDK $code)")
+                }
                 continue
             }
 
@@ -405,7 +431,10 @@ object NetSdk {
 
             val code = lastError()
             attemptErrors.add("stream=$stream SDK=$code")
-            trace("BYTIME", "DownloadByTimeEx не запустился на stream=$stream; SDK=$code; пробую следующий поток", true)
+            trace("BYTIME", "DownloadByTimeEx не запустился на stream=$stream; SDK=$code", true)
+            if (disconnectGeneration.get() != disconnectAtStart) {
+                throw SdkException("Связь NetSDK оборвалась при запуске stream=$stream (SDK $code)")
+            }
         }
 
         if (handle == 0L) {
