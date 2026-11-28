@@ -630,8 +630,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         persistJobs()
     }
 
+    /**
+     * Сохраняет низкоуровневый PTCP trace из Go-моста в общий журнал Android.
+     * Без этого экспорт содержал только ошибку NetSDK, но терял счётчики потерь PTCP.
+     */
+    private fun appendP2pDiagnostics(tag: String) {
+        if (!p2pEnabled) return
+        try {
+            DiagnosticLog.write("INFO", tag, "P2P health: ${P2pBridge.health()}")
+            P2pBridge.diagnostics().lineSequence()
+                .filter { it.isNotBlank() }
+                .forEach { DiagnosticLog.write("TRACE", "P2P", it) }
+        } catch (e: Throwable) {
+            DiagnosticLog.write("WARN", tag, "Не удалось получить P2P diagnostics: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
     fun exportDiagnosticLog(): String {
         return try {
+            appendP2pDiagnostics("LOGGER/P2P-SNAPSHOT")
             val ctx = getApplication<Application>()
             val src = DiagnosticLog.file(ctx)
             if (!src.exists() || src.length() == 0L) return "Журнал пока пуст"
@@ -645,7 +662,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun fullDiagnosticLog(): String = DiagnosticLog.read(getApplication())
+    fun fullDiagnosticLog(): String {
+        appendP2pDiagnostics("LOGGER/P2P-SNAPSHOT")
+        return DiagnosticLog.read(getApplication())
+    }
 
     private fun tempDavFile(id: String): File =
         File(Storage.tempDir(getApplication()), "$id.dav")
@@ -776,12 +796,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: SdkException) {
                 // Частичный файл будет удалён при следующем запуске.
                 update(id) { it.copy(status = JobStatus.ERROR, message = e.message ?: "Ошибка") }
+                appendP2pDiagnostics("DOWNLOAD/P2P-FAIL")
                 DiagnosticLog.write("ERROR", "DOWNLOAD", "Задача $id завершилась SdkException: ${e.message}; временный файл=${tempDavFile(id).absolutePath}; размер=${tempDavFile(id).length()}")
                 addLog("Ошибка задания: ${e.message}")
             } catch (e: Throwable) {
                 update(id) {
                     it.copy(status = JobStatus.ERROR, message = "Сбой: ${e.javaClass.simpleName}: ${e.message}")
                 }
+                appendP2pDiagnostics("DOWNLOAD/P2P-FAIL")
                 DiagnosticLog.write("ERROR", "DOWNLOAD", "Задача $id: ${e.javaClass.name}: ${e.message}")
                 addLog("Сбой задания: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
