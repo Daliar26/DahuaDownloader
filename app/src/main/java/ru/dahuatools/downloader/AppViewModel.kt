@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /** Сколько раз пробовать докачать файл автоматически после восстановления связи. */
-private const val MAX_AUTO_RETRIES = 3
+private const val MAX_AUTO_RETRIES = 0
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -524,7 +524,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Скачать один найденный файл. Если эта запись уже когда-то начинала скачиваться
-     * (ошибка или отмена), продолжает тот же файл с места остановки, а не с начала.
+     * (ошибка или отмена), запускает загрузку заново с начала.
      */
     /** Добавить одну задачу на весь выбранный интервал, не на каждый сегмент архива. */
     fun downloadInterval() {
@@ -574,7 +574,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 message = "Эта запись уже в загрузках"
                 return
             }
-            message = if (existing.status == JobStatus.DONE) "Скачивание заново" else "Продолжаю докачку"
+            message = if (existing.status == JobStatus.DONE) "Скачивание заново" else "Повторное скачивание с начала"
             retryJob(existing.id)
             return
         }
@@ -596,7 +596,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Повторить вручную: продолжит докачку с уже скачанного места, а не с начала. */
+    /** Повторить вручную: начнёт загрузку заново с начала. */
     fun retryJob(id: String) {
         if (!connected) {
             message = "Сначала подключитесь к регистратору"
@@ -606,8 +606,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             if (!it.active) {
                 // DONE сбрасывается на скачивание заново (временный файл уже удалён при успехе),
                 // ERROR/CANCELED продолжат с того места, где остался временный файл.
-                val progress = if (it.status == JobStatus.DONE) 0 else it.progress
-                it.copy(status = JobStatus.QUEUED, message = "", progress = progress)
+                it.copy(status = JobStatus.QUEUED, message = "", progress = 0, retryCount = 0)
             } else it
         }
         launchJob(id)
@@ -665,7 +664,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (job.status != JobStatus.QUEUED) return@withPermit
                     val tmpDav = tempDavFile(id)
                     val byTime = job.deviceFile == "__DOWNLOAD_BY_TIME__"
-                    val resuming = !byTime && tmpDav.exists() && tmpDav.length() > 0
+                    tmpDav.delete()
+                    val resuming = false
 
                     update(id) {
                         it.copy(
@@ -674,10 +674,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             else "Скачивание с регистратора…"
                         )
                     }
-                    DiagnosticLog.write("INFO", "DOWNLOAD", "Задача ${job.id}: старт; режим=${if (byTime) "DownloadByTimeEx, один файл" else "DownloadPieceFile"}; канал=${job.camera}; период=${job.from}..${job.to}; файл=${tmpDav.absolutePath}; продолжение=$resuming")
+                    DiagnosticLog.write("INFO", "DOWNLOAD", "Задача ${job.id}: старт; режим=${if (byTime) "DownloadByTimeEx, один файл" else "DownloadPieceFile"}; канал=${job.camera}; период=${job.from}..${job.to}; файл=${tmpDav.absolutePath}; resumeDisabled=true")
                     addLog(
-                        (if (resuming) "Продолжение: " else "Старт: ") + job.title +
-                            if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else if (byTime) " (единый файл за интервал)" else ""
+                        (if (resuming) "Старт: " else "Старт: ") + job.title +
+                            if (resuming) " (с начала)" else if (byTime) " (единый файл за интервал)" else ""
                     )
                     val progressLastAt = AtomicLong(0L)
                     val progressLastPct = AtomicInteger(-1)
@@ -770,11 +770,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     tempMp4File(id).delete()
                 }
             } catch (e: CancellationException) {
-                // Частичный файл НЕ удаляем: это и есть точка, с которой продолжит докачка.
-                update(id) { it.copy(status = JobStatus.CANCELED, message = "Остановлено, можно продолжить") }
+                // Частичный файл не используется; новый запуск начнётся с нуля.
+                update(id) { it.copy(status = JobStatus.CANCELED, message = "Остановлено; повтор начнётся сначала") }
                 throw e
             } catch (e: SdkException) {
-                // Частичный файл тоже остаётся — для докачки после «Повторить» или авто-продолжения.
+                // Частичный файл будет удалён при следующем запуске.
                 update(id) { it.copy(status = JobStatus.ERROR, message = e.message ?: "Ошибка") }
                 DiagnosticLog.write("ERROR", "DOWNLOAD", "Задача $id завершилась SdkException: ${e.message}; временный файл=${tempDavFile(id).absolutePath}; размер=${tempDavFile(id).length()}")
                 addLog("Ошибка задания: ${e.message}")
