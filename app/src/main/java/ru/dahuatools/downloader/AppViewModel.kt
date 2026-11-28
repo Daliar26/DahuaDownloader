@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /** Сколько раз пробовать докачать файл автоматически после восстановления связи. */
-private const val MAX_AUTO_RETRIES = 3
+private const val MAX_AUTO_RETRIES = 0
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -278,7 +278,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (useP2p) {
                         addLog("P2P: запуск моста; ожидаю локальный TCP-прокси")
                         val p2pError = P2pBridge.start(serial, login, pass, 37778, 37777)
-                        if (p2pError.isNotBlank()) throw SdkException(p2pError)
+                        if (p2pError.isNotBlank()) {
+                            DiagnosticLog.write("ERROR", "P2P/START", "$p2pError\n${P2pBridge.diagnostics()}")
+                            throw SdkException(p2pError)
+                        }
                         p2pStarted = true
                         addLog("P2P-туннель установлен; проверяю соединение NetSDK")
                     }
@@ -424,6 +427,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             P2pBridge.stop()
             val startError = P2pBridge.start(p2pSerial.trim(), user.trim(), p2pPassword, 37778, 37777)
             if (startError.isNotBlank()) {
+                val failedDiagnostics = P2pBridge.diagnostics()
+                DiagnosticLog.write("ERROR", "P2P/RECONNECT", "$startError\n$failedDiagnostics")
                 throw SdkException("Не удалось восстановить P2P: $startError")
             }
             p2pStarted = true
@@ -474,8 +479,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     } catch (e: SdkException) {
                         val code = e.message.orEmpty()
-                        if (p2pEnabled && (code.contains("0x80000204") || code.contains("0x80000181"))) {
-                            DiagnosticLog.write("WARN", "SEARCH/RECOVERY", "FindFile failed on P2P handle=$handleUsed; one reconnect-and-retry: $code")
+                        if (p2pEnabled && (
+                                code.contains("0x80000204", ignoreCase = true) ||
+                                code.contains("0x80000181", ignoreCase = true) ||
+                                code.contains("0x80000002", ignoreCase = true) ||
+                                code.contains("NET_NETWORK_ERROR", ignoreCase = true)
+                            )) {
+                            DiagnosticLog.write("WARN", "SEARCH/RECOVERY", "FindFile transport/session failure on P2P handle=$handleUsed; reconnect-and-retry once: $code")
                             ensureP2pSession(forceReconnect = true, staleHandle = handleUsed)
                             NetSdk.findRecordings(
                                 loginHandle, q.channel0, NetSdk.netTime(q.from), NetSdk.netTime(q.to), 500
@@ -514,7 +524,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Скачать один найденный файл. Если эта запись уже когда-то начинала скачиваться
-     * (ошибка или отмена), продолжает тот же файл с места остановки, а не с начала.
+     * (ошибка или отмена), запускает загрузку заново с начала.
      */
     /** Добавить одну задачу на весь выбранный интервал, не на каждый сегмент архива. */
     fun downloadInterval() {
@@ -564,7 +574,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 message = "Эта запись уже в загрузках"
                 return
             }
-            message = if (existing.status == JobStatus.DONE) "Скачивание заново" else "Продолжаю докачку"
+            message = if (existing.status == JobStatus.DONE) "Скачивание заново" else "Повторное скачивание с начала"
             retryJob(existing.id)
             return
         }
@@ -586,7 +596,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Повторить вручную: продолжит докачку с уже скачанного места, а не с начала. */
+    /** Повторить вручную: начнёт загрузку заново с начала. */
     fun retryJob(id: String) {
         if (!connected) {
             message = "Сначала подключитесь к регистратору"
@@ -596,8 +606,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             if (!it.active) {
                 // DONE сбрасывается на скачивание заново (временный файл уже удалён при успехе),
                 // ERROR/CANCELED продолжат с того места, где остался временный файл.
-                val progress = if (it.status == JobStatus.DONE) 0 else it.progress
-                it.copy(status = JobStatus.QUEUED, message = "", progress = progress)
+                it.copy(status = JobStatus.QUEUED, message = "", progress = 0, retryCount = 0)
             } else it
         }
         launchJob(id)
@@ -621,8 +630,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         persistJobs()
     }
 
+    /**
+     * Сохраняет низкоуровневый PTCP trace из Go-моста в общий журнал Android.
+     * Без этого экспорт содержал только ошибку NetSDK, но терял счётчики потерь PTCP.
+     */
+    private fun appendP2pDiagnostics(tag: String) {
+        if (!p2pEnabled) return
+        try {
+            DiagnosticLog.write("INFO", tag, "P2P health: ${P2pBridge.health()}")
+            P2pBridge.diagnostics().lineSequence()
+                .filter { it.isNotBlank() }
+                .forEach { DiagnosticLog.write("TRACE", "P2P", it) }
+        } catch (e: Throwable) {
+            DiagnosticLog.write("WARN", tag, "Не удалось получить P2P diagnostics: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
     fun exportDiagnosticLog(): String {
         return try {
+            appendP2pDiagnostics("LOGGER/P2P-SNAPSHOT")
             val ctx = getApplication<Application>()
             val src = DiagnosticLog.file(ctx)
             if (!src.exists() || src.length() == 0L) return "Журнал пока пуст"
@@ -636,7 +662,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun fullDiagnosticLog(): String = DiagnosticLog.read(getApplication())
+    fun fullDiagnosticLog(): String {
+        appendP2pDiagnostics("LOGGER/P2P-SNAPSHOT")
+        return DiagnosticLog.read(getApplication())
+    }
 
     private fun tempDavFile(id: String): File =
         File(Storage.tempDir(getApplication()), "$id.dav")
@@ -655,7 +684,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (job.status != JobStatus.QUEUED) return@withPermit
                     val tmpDav = tempDavFile(id)
                     val byTime = job.deviceFile == "__DOWNLOAD_BY_TIME__"
-                    val resuming = !byTime && tmpDav.exists() && tmpDav.length() > 0
+                    tmpDav.delete()
+                    val resuming = false
 
                     update(id) {
                         it.copy(
@@ -664,10 +694,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             else "Скачивание с регистратора…"
                         )
                     }
-                    DiagnosticLog.write("INFO", "DOWNLOAD", "Задача ${job.id}: старт; режим=${if (byTime) "DownloadByTimeEx, один файл" else "DownloadPieceFile"}; канал=${job.camera}; период=${job.from}..${job.to}; файл=${tmpDav.absolutePath}; продолжение=$resuming")
+                    DiagnosticLog.write("INFO", "DOWNLOAD", "Задача ${job.id}: старт; режим=${if (byTime) "DownloadByTimeEx, один файл" else "DownloadPieceFile"}; канал=${job.camera}; период=${job.from}..${job.to}; файл=${tmpDav.absolutePath}; resumeDisabled=true")
                     addLog(
-                        (if (resuming) "Продолжение: " else "Старт: ") + job.title +
-                            if (resuming) " (уже есть ${tmpDav.length() / 1024 / 1024} МБ)" else if (byTime) " (единый файл за интервал)" else ""
+                        (if (resuming) "Старт: " else "Старт: ") + job.title +
+                            if (resuming) " (с начала)" else if (byTime) " (единый файл за интервал)" else ""
                     )
                     val progressLastAt = AtomicLong(0L)
                     val progressLastPct = AtomicInteger(-1)
@@ -760,18 +790,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     tempMp4File(id).delete()
                 }
             } catch (e: CancellationException) {
-                // Частичный файл НЕ удаляем: это и есть точка, с которой продолжит докачка.
-                update(id) { it.copy(status = JobStatus.CANCELED, message = "Остановлено, можно продолжить") }
+                // Частичный файл не используется; новый запуск начнётся с нуля.
+                update(id) { it.copy(status = JobStatus.CANCELED, message = "Остановлено; повтор начнётся сначала") }
                 throw e
             } catch (e: SdkException) {
-                // Частичный файл тоже остаётся — для докачки после «Повторить» или авто-продолжения.
+                // Частичный файл будет удалён при следующем запуске.
                 update(id) { it.copy(status = JobStatus.ERROR, message = e.message ?: "Ошибка") }
+                appendP2pDiagnostics("DOWNLOAD/P2P-FAIL")
                 DiagnosticLog.write("ERROR", "DOWNLOAD", "Задача $id завершилась SdkException: ${e.message}; временный файл=${tempDavFile(id).absolutePath}; размер=${tempDavFile(id).length()}")
                 addLog("Ошибка задания: ${e.message}")
             } catch (e: Throwable) {
                 update(id) {
                     it.copy(status = JobStatus.ERROR, message = "Сбой: ${e.javaClass.simpleName}: ${e.message}")
                 }
+                appendP2pDiagnostics("DOWNLOAD/P2P-FAIL")
                 DiagnosticLog.write("ERROR", "DOWNLOAD", "Задача $id: ${e.javaClass.name}: ${e.message}")
                 addLog("Сбой задания: ${e.javaClass.simpleName}: ${e.message}")
             } finally {

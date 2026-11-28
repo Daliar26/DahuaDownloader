@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	dahua "github.com/blackjid/dahua-p2p"
@@ -26,11 +27,12 @@ type bridge struct {
 }
 
 var (
-	stateMu   sync.Mutex
-	current   *bridge
-	lastError string
-	diagMu    sync.Mutex
-	diagLines []string
+	stateMu       sync.Mutex
+	current       *bridge
+	lastError     string
+	diagMu        sync.Mutex
+	diagLines     []string
+	dnsResolverMu sync.Mutex
 )
 
 const maxDiagnosticLines = 300
@@ -55,6 +57,58 @@ func Diagnostics() string {
 	diagMu.Lock()
 	defer diagMu.Unlock()
 	return strings.Join(diagLines, "\n")
+}
+
+// connectWithDNSFallback first honors Android's configured DNS. If that resolver
+// cannot resolve Dahua's documented main P2P host, it retries through public
+// DNS resolvers. The override is scoped to the handshake and restored before
+// returning; no server IP is hard-coded because Dahua uses dynamic addresses.
+func connectWithDNSFallback(cfg dahua.Config, trace func(string, ...any)) (*dahua.Client, error) {
+	const mainHost = "www.easy4ipcloud.com"
+	dnsResolverMu.Lock()
+	defer dnsResolverMu.Unlock()
+
+	systemResolver := net.DefaultResolver
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ips, systemErr := systemResolver.LookupIPAddr(ctx, mainHost)
+	cancel()
+	if systemErr == nil && len(ips) > 0 {
+		trace("DNS system resolver: %s -> %v", mainHost, ips)
+		return dahua.ConnectWithConfig(cfg)
+	}
+	trace("DNS system resolver failed for %s: %v; trying public DNS fallback", mainHost, systemErr)
+
+	servers := []string{"1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"}
+	var nextServer uint32
+	fallbackResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			index := atomic.AddUint32(&nextServer, 1) - 1
+			server := servers[int(index)%len(servers)]
+			dialer := net.Dialer{Timeout: 3 * time.Second}
+			conn, err := dialer.DialContext(ctx, network, server)
+			if err != nil {
+				trace("DNS fallback socket to %s failed: %v", server, err)
+				return nil, err
+			}
+			trace("DNS fallback query routed to %s", server)
+			return conn, nil
+		},
+	}
+	net.DefaultResolver = fallbackResolver
+	defer func() { net.DefaultResolver = systemResolver }()
+
+	ctx, cancel = context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	ips, err := fallbackResolver.LookupIPAddr(ctx, mainHost)
+	if err != nil || len(ips) == 0 {
+		if err == nil {
+			err = fmt.Errorf("DNS returned no addresses")
+		}
+		return nil, fmt.Errorf("DNS не разрешает %s: системный DNS: %v; резервный DNS: %w", mainHost, systemErr, err)
+	}
+	trace("DNS fallback resolved %s -> %v", mainHost, ips)
+	return dahua.ConnectWithConfig(cfg)
 }
 
 func Health() string {
@@ -109,7 +163,7 @@ func Start(serial, username, password string, localPort, devicePort int) string 
 	var err error
 	for attempt := 1; attempt <= 2; attempt++ {
 		recordDiagnostic("INFO", serial, username, password, "P2P handshake: попытка %d/2", attempt)
-		client, err = dahua.ConnectWithConfig(cfg)
+		client, err = connectWithDNSFallback(cfg, trace)
 		if err == nil {
 			break
 		}

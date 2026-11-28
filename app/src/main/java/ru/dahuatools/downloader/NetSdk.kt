@@ -435,6 +435,15 @@ object NetSdk {
             if (disconnectGeneration.get() != disconnectAtStart) {
                 throw SdkException("Связь NetSDK оборвалась при запуске stream=$stream (SDK $code)")
             }
+            // NET_NETWORK_ERROR — транспортная ошибка, а не отказ конкретного
+            // видеопотока. Перебор stream=1/2 создаёт дополнительные BIND/realm
+            // запросы через уже нестабильный P2P-туннель и ускоряет его отказ.
+            if (code.equals("0x80000002", ignoreCase = true)) {
+                throw SdkException(
+                    "NetSDK сообщил NET_NETWORK_ERROR при запуске stream=$stream (SDK $code). " +
+                        "Останавливаю перебор потоков и передаю управление восстановлению P2P."
+                )
+            }
         }
 
         if (handle == 0L) {
